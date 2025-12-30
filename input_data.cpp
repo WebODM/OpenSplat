@@ -94,6 +94,18 @@ void Camera::loadImage(float downscaleFactor){
     fy = K[1][1].item<float>();
     cx = K[0][2].item<float>();
     cy = K[1][2].item<float>();
+
+    // Load mask if path is set
+    if (!maskPath.empty()){
+        cv::Mat cMask = imreadMask(maskPath);
+
+        // Resize mask to match image dimensions
+        if (cMask.rows != height || cMask.cols != width){
+            cv::resize(cMask, cMask, cv::Size(width, height), 0.0, 0.0, cv::INTER_NEAREST);
+        }
+
+        mask = maskToTensor(cMask);
+    }
 }
 
 torch::Tensor Camera::getImage(int downscaleFactor){
@@ -114,6 +126,27 @@ torch::Tensor Camera::getImage(int downscaleFactor){
         imagePyramids[downscaleFactor] = t;
         return t;
     }
+}
+
+torch::Tensor Camera::getMask(int downscaleFactor){
+    if (!mask.numel()) return torch::Tensor();  // No mask available
+
+    if (downscaleFactor <= 1) return mask;
+
+    if (maskPyramids.find(downscaleFactor) != maskPyramids.end()){
+        return maskPyramids[downscaleFactor];
+    }
+
+    // Rescale using nearest neighbor (preserve binary values)
+    cv::Mat cMask = tensorToMask(mask);
+    cv::resize(cMask, cMask, cv::Size(cMask.cols / downscaleFactor, cMask.rows / downscaleFactor), 0.0, 0.0, cv::INTER_NEAREST);
+    torch::Tensor t = maskToTensor(cMask);
+    maskPyramids[downscaleFactor] = t;
+    return t;
+}
+
+bool Camera::hasMask() const {
+    return mask.numel() > 0;
 }
 
 bool Camera::hasDistortionParameters(){

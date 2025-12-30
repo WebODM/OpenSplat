@@ -42,6 +42,7 @@ int main(int argc, char *argv[]){
         ("stop-screen-size-at", "Stop splitting gaussians that are larger than [split-screen-size] after these many steps", cxxopts::value<int>()->default_value("4000"))
         ("split-screen-size", "Split gaussians that are larger than this percentage of screen space", cxxopts::value<float>()->default_value("0.05"))
         ("colmap-image-path", "Override the default image path for COLMAP-based input", cxxopts::value<std::string>()->default_value(""))
+        ("mask-dir", "Path to directory containing mask images (binary: 0=exclude, 1=include)", cxxopts::value<std::string>()->default_value(""))
 #ifdef USE_VISUALIZATION
         ("has-visualization", "Show the visualization steps of training", cxxopts::value<bool>()->default_value("0"))
 #endif
@@ -95,6 +96,7 @@ int main(int argc, char *argv[]){
     const int stopScreenSizeAt = result["stop-screen-size-at"].as<int>();
     const float splitScreenSize = result["split-screen-size"].as<float>();
     const std::string colmapImageSourcePath = result["colmap-image-path"].as<std::string>();
+    const std::string maskDir = result["mask-dir"].as<std::string>();
 #ifdef USE_VISUALIZATION
     const bool hasVisualization = result["has-visualization"].as<bool>();
 #endif
@@ -120,6 +122,33 @@ int main(int argc, char *argv[]){
 
     try{
         InputData inputData = inputDataFromX(projectRoot, colmapImageSourcePath);
+
+        // Set mask paths if mask directory is provided
+        if (!maskDir.empty()){
+            fs::path maskDirPath(maskDir);
+            if (!fs::exists(maskDirPath)){
+                std::cerr << "Mask directory does not exist: " << maskDir << std::endl;
+                exit(1);
+            }
+
+            for (Camera &cam : inputData.cameras){
+                fs::path imagePath(cam.filePath);
+                std::string imageName = imagePath.stem().string();
+
+                // Try common mask extensions
+                for (const std::string &ext : {".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"}){
+                    fs::path maskPath = maskDirPath / (imageName + ext);
+                    if (fs::exists(maskPath)){
+                        cam.maskPath = maskPath.string();
+                        break;
+                    }
+                }
+
+                if (cam.maskPath.empty()){
+                    std::cerr << "Warning: No mask found for " << cam.filePath << std::endl;
+                }
+            }
+        }
 
         parallel_for(inputData.cameras.begin(), inputData.cameras.end(), [&downScaleFactor](Camera &cam){
             cam.loadImage(downScaleFactor);
@@ -157,7 +186,13 @@ int main(int argc, char *argv[]){
             torch::Tensor gt = cam.getImage(model.getDownscaleFactor(step));
             gt = gt.to(device);
 
-            torch::Tensor mainLoss = model.mainLoss(rgb, gt, ssimWeight);
+            torch::Tensor mask;
+            if (cam.hasMask()){
+                mask = cam.getMask(model.getDownscaleFactor(step));
+                mask = mask.to(device);
+            }
+
+            torch::Tensor mainLoss = model.mainLoss(rgb, gt, ssimWeight, mask);
             mainLoss.backward();
             
             if (step % displayStep == 0) {
@@ -203,7 +238,11 @@ int main(int argc, char *argv[]){
         if (valCam != nullptr){
             torch::Tensor rgb = model.forward(*valCam, numIters);
             torch::Tensor gt = valCam->getImage(model.getDownscaleFactor(numIters)).to(device);
-            std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rgb, gt, ssimWeight).item<float>() << std::endl; 
+            torch::Tensor valMask;
+            if (valCam->hasMask()){
+                valMask = valCam->getMask(model.getDownscaleFactor(numIters)).to(device);
+            }
+            std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rgb, gt, ssimWeight, valMask).item<float>() << std::endl;
         }
     }catch(const std::exception &e){
         std::cerr << e.what() << std::endl;
