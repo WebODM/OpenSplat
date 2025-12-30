@@ -12,7 +12,7 @@ public:
         window = createWindow();
     };
 
-    torch::Tensor eval(const torch::Tensor& rendered, const torch::Tensor& gt);
+    torch::Tensor eval(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& mask = torch::Tensor());
 private:
     torch::Tensor createWindow();
     torch::Tensor gaussian(float sigma);

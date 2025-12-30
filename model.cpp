@@ -51,8 +51,16 @@ torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt){
     return (10.f * torch::log10(1.0 / mse));
 }
 
-torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt){
-    return torch::abs(gt - rendered).mean();
+torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& mask){
+    torch::Tensor diff = torch::abs(gt - rendered);
+    if (mask.numel() > 0){
+        // Expand mask from [H,W,1] to [H,W,3] for broadcasting
+        torch::Tensor expandedMask = mask.expand_as(diff);
+        // Masked mean: sum of masked values / count of masked pixels
+        torch::Tensor maskedDiff = diff * expandedMask;
+        return maskedDiff.sum() / (expandedMask.sum() + 1e-8f);
+    }
+    return diff.mean();
 }
 
 void Model::setupOptimizers(){
@@ -777,8 +785,8 @@ int Model::loadPly(const std::string &filename){
     throw std::runtime_error("Invalid PLY file");
 }
 
-torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, float ssimWeight){
-    torch::Tensor ssimLoss = 1.0f - ssim.eval(rgb, gt);
-    torch::Tensor l1Loss = l1(rgb, gt);
+torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, float ssimWeight, const torch::Tensor &mask){
+    torch::Tensor ssimLoss = 1.0f - ssim.eval(rgb, gt, mask);
+    torch::Tensor l1Loss = l1(rgb, gt, mask);
     return (1.0f - ssimWeight) * l1Loss + ssimWeight * ssimLoss;
 }
