@@ -133,7 +133,7 @@ int main(int argc, char *argv[]){
 
             for (Camera &cam : inputData.cameras){
                 fs::path imagePath(cam.filePath);
-                std::string imageName = imagePath.stem().string();
+                std::string imageName = imagePath.filename().string();
 
                 // Try common mask extensions
                 for (const std::string &ext : {".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"}){

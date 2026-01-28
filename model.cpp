@@ -54,11 +54,8 @@ torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt){
 torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& mask){
     torch::Tensor diff = torch::abs(gt - rendered);
     if (mask.numel() > 0){
-        // Expand mask from [H,W,1] to [H,W,3] for broadcasting
         torch::Tensor expandedMask = mask.expand_as(diff);
-        // Masked mean: sum of masked values / count of masked pixels
-        torch::Tensor maskedDiff = diff * expandedMask;
-        return maskedDiff.sum() / (expandedMask.sum() + 1e-8f);
+        diff *= expandedMask;
     }
     return diff.mean();
 }

@@ -12,6 +12,7 @@ torch::Tensor SSIM::eval(const torch::Tensor& rendered, const torch::Tensor& gt,
 	if (mask.numel() > 0){
         torch::Tensor ssimMask = mask.permute({2, 0, 1}).index({None, "..."});
         ssimMask = ssimMask.expand_as(img1);
+    
 		img1 = img1 * ssimMask;
 		img2 = img2 * ssimMask;
     }

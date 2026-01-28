@@ -59,6 +59,7 @@ torch::Tensor imageToTensor(const cv::Mat &image){
 
 torch::Tensor maskToTensor(const cv::Mat &mask){
     torch::Tensor m = torch::from_blob(mask.data, { mask.rows, mask.cols, 1 }, torch::kU8);
+    
     // Binary mask: threshold at 128, output 0.0 or 1.0
     return (m.toType(torch::kFloat32) / 255.0f).ge(0.5f).toType(torch::kFloat32);
 }

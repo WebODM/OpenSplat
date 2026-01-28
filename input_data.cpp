@@ -97,6 +97,9 @@ void Camera::loadImage(float downscaleFactor){
 
     // Load mask if path is set
     if (!maskPath.empty()){
+
+        std::cout << "Loading mask " << maskPath << std::endl;
+
         cv::Mat cMask = imreadMask(maskPath);
 
         // Resize mask to match image dimensions
