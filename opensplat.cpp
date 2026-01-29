@@ -133,16 +133,18 @@ int main(int argc, char *argv[]){
 
             for (Camera &cam : inputData.cameras){
                 fs::path imagePath(cam.filePath);
-                std::string imageName = imagePath.filename().string();
+                std::string imageName = imagePath.filename().string(),
+                            imageStem = imagePath.stem().string();
 
                 // Try common mask extensions
-                for (const std::string &ext : {".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"}){
-                    fs::path maskPath = maskDirPath / (imageName + ext);
-                    if (fs::exists(maskPath)){
-                        cam.maskPath = maskPath.string();
-                        break;
+                for(const std::string & name : { imageName, imageStem})
+                    for (const std::string &ext : {".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"}){
+                        fs::path maskPath = maskDirPath / (name + ext);
+                        if (fs::exists(maskPath)){
+                            cam.maskPath = maskPath.string();
+                            break;
+                        }
                     }
-                }
 
                 if (cam.maskPath.empty()){
                     std::cerr << "Warning: No mask found for " << cam.filePath << std::endl;
