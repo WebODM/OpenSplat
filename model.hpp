@@ -17,7 +17,7 @@ using namespace torch::autograd;
 torch::Tensor randomQuatTensor(long long n);
 torch::Tensor projectionMatrix(float zNear, float zFar, float fovX, float fovY, const torch::Device &device);
 torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt);
-torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& mask = torch::Tensor());
+torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& alpha, const torch::Tensor& mask = torch::Tensor());
 
 struct Model{
   Model(const InputData &inputData, int numCameras,
@@ -63,7 +63,7 @@ struct Model{
   void setupOptimizers();
   void releaseOptimizers();
 
-  torch::Tensor forward(Camera& cam, int step);
+  tensor_list forward(Camera& cam, int step);
   void optimizersZeroGrad();
   void optimizersStep();
   void schedulersStep(int step);
@@ -74,7 +74,7 @@ struct Model{
   void saveSplat(const std::string &filename);
   void saveDebugPly(const std::string &filename, int step);
   int loadPly(const std::string &filename);
-  torch::Tensor mainLoss(torch::Tensor &rgb, torch::Tensor &gt, float ssimWeight, const torch::Tensor &mask = torch::Tensor());
+  torch::Tensor mainLoss(torch::Tensor &rgb, const torch::Tensor& alpha, torch::Tensor &gt, float ssimWeight, const torch::Tensor &mask = torch::Tensor());
 
   void addToOptimizer(torch::optim::Adam *optimizer, const torch::Tensor &newParam, const torch::Tensor &idcs, int nSamples);
   void removeFromOptimizer(torch::optim::Adam *optimizer, const torch::Tensor &newParam, const torch::Tensor &deletedMask);

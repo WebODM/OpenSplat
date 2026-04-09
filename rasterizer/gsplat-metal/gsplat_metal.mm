@@ -577,6 +577,9 @@ std::tuple<
     torch::Tensor out_img = torch::zeros(
         {img_height, img_width, channels}, xys.options().dtype(torch::kFloat32)
     );
+    torch::Tensor out_alpha = torch::zeros(
+        {img_height, img_width}, xys.options().dtype(torch::kFloat32)
+    );
     torch::Tensor final_Ts = torch::zeros(
         {img_height, img_width}, xys.options().dtype(torch::kFloat32)
     );
@@ -609,11 +612,12 @@ std::tuple<
         EncodeArg::tensor(final_Ts),
         EncodeArg::tensor(final_idx),
         EncodeArg::tensor(out_img),
+        EncodeArg::tensor(out_alpha),
         EncodeArg::tensor(background),
         EncodeArg::array(block_size_dim2, sizeof(block_size_dim2))
     });
 
-    return std::make_tuple(out_img, final_Ts, final_idx);
+    return std::make_tuple(out_img, out_alpha, final_Ts, final_idx);
 }
 
 std::tuple<
@@ -648,6 +652,9 @@ std::tuple<
     torch::Tensor out_img = torch::zeros(
         {img_height, img_width, channels}, xys.options().dtype(torch::kFloat32)
     );
+    torch::Tensor out_alpha = torch::zeros(
+        {img_height, img_width}, xys.options().dtype(torch::kFloat32)
+    );
     torch::Tensor final_Ts = torch::zeros(
         {img_height, img_width}, xys.options().dtype(torch::kFloat32)
     );
@@ -680,11 +687,12 @@ std::tuple<
         EncodeArg::tensor(final_Ts),
         EncodeArg::tensor(final_idx),
         EncodeArg::tensor(out_img),
+        EncodeArg::tensor(out_alpha),
         EncodeArg::tensor(background),
         EncodeArg::array(block_size_dim2, sizeof(block_size_dim2))
     });
 
-    return std::make_tuple(out_img, final_Ts, final_idx);
+    return std::make_tuple(out_img, out_alpha, final_Ts, final_idx);
 }
 
 

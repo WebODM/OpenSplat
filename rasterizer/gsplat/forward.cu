@@ -184,6 +184,7 @@ __global__ void nd_rasterize_forward(
     float* __restrict__ final_Ts,
     int* __restrict__ final_index,
     float* __restrict__ out_img,
+    float* __restrict__ out_alpha,
     const float* __restrict__ background
 ) {
     // current naive implementation where tile data loading is redundant
@@ -240,6 +241,7 @@ __global__ void nd_rasterize_forward(
         const float vis = alpha * T;
         for (int c = 0; c < channels; ++c) {
             out_img[channels * pix_id + c] += colors[channels * g + c] * vis;
+            out_alpha[pix_id] += vis;
         }
         T = next_T;
     }
@@ -265,6 +267,7 @@ __global__ void rasterize_forward(
     float* __restrict__ final_Ts,
     int* __restrict__ final_index,
     float3* __restrict__ out_img,
+    float* __restrict__ out_alpha,
     const float3& __restrict__ background
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
@@ -306,7 +309,8 @@ __global__ void rasterize_forward(
     // each thread loads one gaussian at a time before rasterizing its
     // designated pixel
     int tr = block.thread_rank();
-    float3 pix_out = {0.f, 0.f, 0.f};
+    float3 pix_out   = {0.f, 0.f, 0.f};
+    float  alpha_out = 0.f;
     for (int b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -359,6 +363,7 @@ __global__ void rasterize_forward(
             pix_out.x = pix_out.x + c.x * vis;
             pix_out.y = pix_out.y + c.y * vis;
             pix_out.z = pix_out.z + c.z * vis;
+            alpha_out = alpha_out + vis;
             T = next_T;
             cur_idx = batch_start + t;
         }
@@ -367,13 +372,13 @@ __global__ void rasterize_forward(
     if (inside) {
         // add background
         final_Ts[pix_id] = T; // transmittance at last gaussian in this pixel
-        final_index[pix_id] =
-            cur_idx; // index of in bin of last gaussian in this pixel
+        final_index[pix_id] = cur_idx; // index of in bin of last gaussian in this pixel
         float3 final_color;
         final_color.x = pix_out.x + T * background.x;
         final_color.y = pix_out.y + T * background.y;
         final_color.z = pix_out.z + T * background.z;
         out_img[pix_id] = final_color;
+        out_alpha[pix_id] = alpha_out; // I guess the background isn't really interesting for the alpha
     }
 }
 

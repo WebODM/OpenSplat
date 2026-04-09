@@ -377,6 +377,9 @@ rasterize_forward_tensor(
     torch::Tensor out_img = torch::zeros(
         {img_height, img_width, channels}, xys.options().dtype(torch::kFloat32)
     );
+    torch::Tensor out_alpha = torch::zeros(
+        {img_height, img_width}, xys.options().dtype(torch::kFloat32)
+    );
     torch::Tensor final_Ts = torch::zeros(
         {img_height, img_width}, xys.options().dtype(torch::kFloat32)
     );
@@ -396,10 +399,11 @@ rasterize_forward_tensor(
         final_Ts.contiguous().data_ptr<float>(),
         final_idx.contiguous().data_ptr<int>(),
         (float3 *)out_img.contiguous().data_ptr<float>(),
+        (float *)out_alpha.contiguous().data_ptr<float>(),
         *(float3 *)background.contiguous().data_ptr<float>()
     );
 
-    return std::make_tuple(out_img, final_Ts, final_idx);
+    return std::make_tuple(out_img, out_alpha, final_Ts, final_idx);
 }
 
 
@@ -446,6 +450,9 @@ nd_rasterize_forward_tensor(
     torch::Tensor out_img = torch::zeros(
         {img_height, img_width, channels}, xys.options().dtype(torch::kFloat32)
     );
+    torch::Tensor out_alpha = torch::zeros(
+        {img_height, img_width}, xys.options().dtype(torch::kFloat32)
+    );
     torch::Tensor final_Ts = torch::zeros(
         {img_height, img_width}, xys.options().dtype(torch::kFloat32)
     );
@@ -466,10 +473,11 @@ nd_rasterize_forward_tensor(
         final_Ts.contiguous().data_ptr<float>(),
         final_idx.contiguous().data_ptr<int>(),
         out_img.contiguous().data_ptr<float>(),
+        out_alpha.contiguous().data_ptr<float>(),
         background.contiguous().data_ptr<float>()
     );
 
-    return std::make_tuple(out_img, final_Ts, final_idx);
+    return std::make_tuple(out_img, out_alpha, final_Ts, final_idx);
 }
 
 

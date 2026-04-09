@@ -36,7 +36,7 @@ std::tuple<torch::Tensor,
     return std::make_tuple(isectIds, gaussianIds, isectIdsSorted, gaussianIdsSorted, tileBins);
 }
 
-torch::Tensor RasterizeGaussians::forward(AutogradContext *ctx, 
+tensor_list RasterizeGaussians::forward(AutogradContext *ctx, 
             torch::Tensor xys,
             torch::Tensor depths,
             torch::Tensor radii,
@@ -76,21 +76,22 @@ torch::Tensor RasterizeGaussians::forward(AutogradContext *ctx,
                             background);
     // Final image
     torch::Tensor outImg = std::get<0>(t);
-
-    torch::Tensor finalTs = std::get<1>(t);
+    torch::Tensor outAlpha = std::get<1>(t);
+    torch::Tensor finalTs = std::get<2>(t);
 
     // Map of tile bin IDs
-    torch::Tensor finalIdx = std::get<2>(t);
+    torch::Tensor finalIdx = std::get<3>(t);
 
     ctx->saved_data["imgWidth"] = imgWidth;
     ctx->saved_data["imgHeight"] = imgHeight;
     ctx->save_for_backward({ gaussianIdsSorted, tileBins, xys, conics, colors, opacity, background, finalTs, finalIdx });
     
-    return outImg;
+    return { outImg, outAlpha };
 }
 
 tensor_list RasterizeGaussians::backward(AutogradContext *ctx, tensor_list grad_outputs) {
     torch::Tensor v_outImg = grad_outputs[0];
+    torch::Tensor v_outAlpha = grad_outputs[1];
     int imgHeight = ctx->saved_data["imgHeight"].toInt();
     int imgWidth = ctx->saved_data["imgWidth"].toInt();
 
@@ -105,8 +106,6 @@ tensor_list RasterizeGaussians::backward(AutogradContext *ctx, tensor_list grad_
     torch::Tensor finalTs = saved[7];
     torch::Tensor finalIdx = saved[8];
 
-    torch::Tensor v_outAlpha = torch::zeros_like(v_outImg.index({"...", 0}));
-    
     auto t = rasterize_backward_tensor(imgHeight, imgWidth, 
                             gaussianIdsSorted,
                             tileBins,
@@ -141,7 +140,7 @@ tensor_list RasterizeGaussians::backward(AutogradContext *ctx, tensor_list grad_
 
 #endif
 
-torch::Tensor RasterizeGaussiansCPU::forward(AutogradContext *ctx, 
+tensor_list RasterizeGaussiansCPU::forward(AutogradContext *ctx, 
             torch::Tensor xys,
             torch::Tensor radii,
             torch::Tensor conics,
@@ -167,20 +166,21 @@ torch::Tensor RasterizeGaussiansCPU::forward(AutogradContext *ctx,
                             );
     // Final image
     torch::Tensor outImg = std::get<0>(t);
-
-    torch::Tensor finalTs = std::get<1>(t);
-    std::vector<int32_t> *px2gid = std::get<2>(t);
+    torch::Tensor outAlpha = std::get<1>(t);
+    torch::Tensor finalTs = std::get<2>(t);
+    std::vector<int32_t> *px2gid = std::get<3>(t);
 
     ctx->saved_data["px2gid"] = reinterpret_cast<int64_t>(px2gid);
     ctx->saved_data["imgWidth"] = imgWidth;
     ctx->saved_data["imgHeight"] = imgHeight;
     ctx->save_for_backward({ xys, conics, colors, opacity, background, cov2d, camDepths, finalTs });
     
-    return outImg;
+    return { outImg, outAlpha };
 }
 
 tensor_list RasterizeGaussiansCPU::backward(AutogradContext *ctx, tensor_list grad_outputs) {
     torch::Tensor v_outImg = grad_outputs[0];
+    torch::Tensor v_outAlpha = grad_outputs[1];
     int imgHeight = ctx->saved_data["imgHeight"].toInt();
     int imgWidth = ctx->saved_data["imgWidth"].toInt();
     const std::vector<int32_t> *px2gid = reinterpret_cast<const std::vector<int32_t> *>(ctx->saved_data["px2gid"].toInt());
@@ -195,8 +195,6 @@ tensor_list RasterizeGaussiansCPU::backward(AutogradContext *ctx, tensor_list gr
     torch::Tensor camDepths = saved[6];
     torch::Tensor finalTs = saved[7];
 
-    torch::Tensor v_outAlpha = torch::zeros_like(v_outImg.index({"...", 0}));
-    
     auto t = rasterize_backward_tensor_cpu(imgHeight, imgWidth, 
                             xys,
                             conics,

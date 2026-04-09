@@ -145,7 +145,7 @@ int main(int argc, char **argv){
 
     torch::optim::Adam optimizer({rgbs, means, scales, opacities, quats}, learningRate);
     torch::nn::MSELoss mseLoss;
-    torch::Tensor outImg;
+    torch::Tensor outImg, outAlpha;
 
     for (size_t i = 0; i < iterations; i++){
         if (device == torch::kCPU){
@@ -157,7 +157,7 @@ int main(int argc, char **argv){
                                 height,
                                 width);
             
-            outImg = RasterizeGaussiansCPU::apply(
+            tensor_list rgba = RasterizeGaussiansCPU::apply(
                 p[0], // xys
                 p[1], // radii,
                 p[2], // conics
@@ -168,6 +168,8 @@ int main(int argc, char **argv){
                 height,
                 width,
                 background);
+            outImg = rgba[0];
+            outAlpha = rgba[1];
         }else{
             #if defined(USE_HIP) || defined(USE_CUDA) || defined(USE_MPS)
                 auto p = ProjectGaussians::apply(means, scales, 1, 
@@ -179,7 +181,7 @@ int main(int argc, char **argv){
                                         width,
                                         tileBounds);
 
-                outImg = RasterizeGaussians::apply(
+            tensor_list rgba = RasterizeGaussians::apply(
                     p[0], // xys
                     p[1], // depths
                     p[2], // radii,
@@ -190,6 +192,8 @@ int main(int argc, char **argv){
                     height,
                     width,
                     background);
+            outImg = rgba[0];
+            outAlpha = rgba[1];
             #else
                 throw std::runtime_error("GPU support not built, use --cpu");
             #endif

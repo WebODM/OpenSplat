@@ -133,6 +133,7 @@ project_gaussians_forward_tensor_cpu(
 std::tuple<
     torch::Tensor,
     torch::Tensor,
+    torch::Tensor,
     std::vector<int32_t> *
 > rasterize_forward_tensor_cpu(
     const int width,
@@ -161,6 +162,7 @@ std::tuple<
     torch::Device device = xys.device();
 
     torch::Tensor outImg = torch::zeros({height, width, channels}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    torch::Tensor outAlpha = torch::zeros({height, width}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
     torch::Tensor finalTs = torch::ones({height, width}, torch::TensorOptions().dtype(torch::kFloat32).device(device));   
     torch::Tensor done = torch::zeros({height, width}, torch::TensorOptions().dtype(torch::kBool).device(device));   
 
@@ -174,6 +176,7 @@ std::tuple<
     float *pOpacities = static_cast<float *>(opacities.data_ptr());
 
     float *pOutImg = static_cast<float *>(outImg.data_ptr());
+    float *pOutAlpha = static_cast<float *>(outAlpha.data_ptr());
     float *pFinalTs = static_cast<float *>(finalTs.data_ptr());
     bool *pDone = static_cast<bool *>(done.data_ptr());
 
@@ -232,7 +235,7 @@ std::tuple<
                 pOutImg[pixIdx * 3 + 0] += vis * pColors[gaussianId * 3 + 0];
                 pOutImg[pixIdx * 3 + 1] += vis * pColors[gaussianId * 3 + 1];
                 pOutImg[pixIdx * 3 + 2] += vis * pColors[gaussianId * 3 + 2];
-                
+                pOutAlpha[pixIdx] += vis;
                 pFinalTs[pixIdx] = nextT;
                 px2gid[pixIdx].push_back(gaussianId);
             }
@@ -253,7 +256,7 @@ std::tuple<
         }
     }
 
-    return std::make_tuple(outImg, finalTs, px2gid);
+    return std::make_tuple(outImg, outAlpha, finalTs, px2gid);
 }
 
 

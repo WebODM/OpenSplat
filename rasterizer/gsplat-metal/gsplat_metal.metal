@@ -445,6 +445,7 @@ kernel void nd_rasterize_forward_kernel(
     device float* final_Ts,
     device int* final_index,
     device float* out_img,
+    device float* out_alpha,
     constant float* background,
     constant uint2& blockDim, 
     uint2 blockIdx [[threadgroup_position_in_grid]],
@@ -504,6 +505,7 @@ kernel void nd_rasterize_forward_kernel(
         const float vis = alpha * T;
         for (int c = 0; c < channels; ++c) {
             out_img[channels * pix_id + c] += colors[channels * g + c] * vis;
+            out_alpha[pix_id] += vis;
         }
         T = next_T;
     }

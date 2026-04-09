@@ -51,13 +51,31 @@ torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt){
     return (10.f * torch::log10(1.0 / mse));
 }
 
-torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& mask){
-    torch::Tensor diff = torch::abs(gt - rendered);
+//define these somewhere
+float __mask_opacity_penalty_power  = 2.0,
+      __mask_opacity_penalty_weight = 1.0;
+
+torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& alpha, const torch::Tensor& mask){
+    torch::Tensor diff = torch::abs(gt - rendered),
+    maskPenalty = torch::zeros_like(diff);
+
+
     if (mask.numel() > 0){
         torch::Tensor expandedMask = mask.expand_as(diff);
-        diff *= expandedMask;
+        
+        //maskPenalty = torch::zeros_like(expandedMask)
+
+        const torch::Tensor bg_mask            = 1.0 - expandedMask,
+                            penalty_weights    = bg_mask.pow(__mask_opacity_penalty_power),
+                            penalty            = (expandedMask * penalty_weights).mean() * __mask_opacity_penalty_weight; // de penalty wordt bepaald aan de hand penalty gewicht * penalty_weights
+
+        const float inv_pixels = __mask_opacity_penalty_weight / static_cast<float>(expandedMask.numel()); //deel de opacity weight door het aantal elementen in de alpha lijst
+        maskPenalty = penalty_weights * inv_pixels; //Grad alpha wordt dan de 2d penalty kaart teruggebracht tot een 
+        //loss = loss + penalty;
+
+        // hier moet ik alpha in krijgen zodat ik met de inverse daarvan hier vervolgens het gradient mee kan maken
     }
-    return diff.mean();
+    return (diff + maskPenalty).mean();
 }
 
 void Model::setupOptimizers(){
@@ -85,7 +103,7 @@ void Model::releaseOptimizers(){
 }
 
 
-torch::Tensor Model::forward(Camera& cam, int step){
+tensor_list Model::forward(Camera& cam, int step){
 
     const float scaleFactor = getDownscaleFactor(step);
     const float fx = cam.fx / scaleFactor;
@@ -123,7 +141,7 @@ torch::Tensor Model::forward(Camera& cam, int step){
     torch::Tensor numTilesHit; // GPU-only
     torch::Tensor cov2d; // CPU-only
     torch::Tensor camDepths; // CPU-only
-    torch::Tensor rgb;
+    torch::Tensor rgb, alpha;
 
     if (device == torch::kCPU){
         auto p = ProjectGaussiansCPU::apply(means, 
@@ -176,7 +194,7 @@ torch::Tensor Model::forward(Camera& cam, int step){
     xys.retain_grad();
 
     if (radii.sum().item<float>() == 0.0f)
-        return backgroundColor.repeat({height, width, 1});
+        return { backgroundColor.repeat({height, width, 1}),  torch::zeros({height, width, 1}) };
 
     torch::Tensor viewDirs = means.detach() - T.transpose(0, 1).to(device);
     viewDirs = viewDirs / viewDirs.norm(2, {-1}, true);
@@ -197,7 +215,7 @@ torch::Tensor Model::forward(Camera& cam, int step){
     rgbs = torch::clamp_min(rgbs + 0.5f, 0.0f);
 
     if (device == torch::kCPU){
-        rgb = RasterizeGaussiansCPU::apply(
+        auto rgba = RasterizeGaussiansCPU::apply(
                 xys,
                 radii,
                 conics,
@@ -208,9 +226,11 @@ torch::Tensor Model::forward(Camera& cam, int step){
                 height,
                 width,
                 backgroundColor);
+        rgb = rgba[0];
+        alpha = rgba[1];
     }else{  
         #if defined(USE_HIP) || defined(USE_CUDA) || defined(USE_MPS)
-        rgb = RasterizeGaussians::apply(
+        auto rgba = RasterizeGaussians::apply(
                 xys,
                 depths,
                 radii,
@@ -221,12 +241,15 @@ torch::Tensor Model::forward(Camera& cam, int step){
                 height,
                 width,
                 backgroundColor);
+        rgb = rgba[0];
+        alpha = rgba[1];
         #endif
     }
 
     rgb = torch::clamp_max(rgb, 1.0f);
+    alpha = torch::clamp_max(alpha, 1.0f);
 
-    return rgb;
+    return { rgb, alpha };
 }
 
 void Model::optimizersZeroGrad(){
@@ -782,8 +805,8 @@ int Model::loadPly(const std::string &filename){
     throw std::runtime_error("Invalid PLY file");
 }
 
-torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, float ssimWeight, const torch::Tensor &mask){
+torch::Tensor Model::mainLoss(torch::Tensor &rgb, const torch::Tensor& alpha, torch::Tensor &gt, float ssimWeight, const torch::Tensor &mask){
     torch::Tensor ssimLoss = 1.0f - ssim.eval(rgb, gt, mask);
-    torch::Tensor l1Loss = l1(rgb, gt, mask);
+    torch::Tensor l1Loss = l1(rgb, gt, alpha, mask);
     return (1.0f - ssimWeight) * l1Loss + ssimWeight * ssimLoss;
 }

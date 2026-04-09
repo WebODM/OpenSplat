@@ -22,7 +22,7 @@ std::tuple<torch::Tensor,
 
 class RasterizeGaussians : public Function<RasterizeGaussians>{
 public:
-    static torch::Tensor forward(AutogradContext *ctx, 
+    static tensor_list forward(AutogradContext *ctx, 
             torch::Tensor xys,
             torch::Tensor depths,
             torch::Tensor radii,
@@ -40,7 +40,7 @@ public:
 
 class RasterizeGaussiansCPU : public Function<RasterizeGaussiansCPU>{
 public:
-    static torch::Tensor forward(AutogradContext *ctx, 
+    static tensor_list forward(AutogradContext *ctx, 
             torch::Tensor xys,
             torch::Tensor radii,
             torch::Tensor conics,

@@ -107,7 +107,8 @@ __global__ void nd_rasterize_backward_kernel(
             // update the running sum
             S[c] += rgbs[channels * g + c] * fac;
         }
-        v_alpha += T_final * ra * v_out_alpha;
+        //This used to be a noop cause it was zeros? //v_alpha += T_final * ra * v_out_alpha;
+        
         // update v_opacity for this gaussian
         atomicAdd(&(v_opacity[g]), vis * v_alpha);
 
@@ -310,7 +311,7 @@ __global__ void rasterize_backward_kernel(
                 v_alpha += (rgb.y * T - buffer.y * ra) * v_out.y;
                 v_alpha += (rgb.z * T - buffer.z * ra) * v_out.z;
 
-                v_alpha += T_final * ra * v_out_alpha;
+                //Also a noop ? v_alpha += T_final * ra * v_out_alpha;
                 // contribution from background pixel
                 v_alpha += -T_final * ra * background.x * v_out.x;
                 v_alpha += -T_final * ra * background.y * v_out.y;
