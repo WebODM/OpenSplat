@@ -240,7 +240,7 @@ InputData inputDataFromOpenMVG(const std::string &projectRoot){
         throw std::runtime_error("No colorized.ply found, cloud_and_poses found, please run openMVG_main_ComputeSfM_DataColor and name the output colorized.ply");
     }
     if (!fs::exists(cmRoot / "cloud_and_poses.ply") && !fs::exists(colorPointCloud)){
-        throw std::runtime_error("No project files found, please check the file path for sfm_data.json or sfm_data.bin");
+        throw std::runtime_error("No colorized.ply found, cloud_and_poses.ply found, please run openMVG_main_ComputeSfM_DataColor and name the output colorized.ply");
     }
 
     std::ifstream f(reconstructionPath.string());
