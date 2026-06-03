@@ -3,6 +3,14 @@
 
 # build
 build/
+build-*/
 my_build/
 .idea/
 .vscode/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
