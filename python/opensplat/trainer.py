@@ -56,3 +56,36 @@ class Trainer:
             self.device,
         )
         self._step = 0
+        import random
+        self._rng = random.Random(42)
+
+    def __iter__(self) -> "Trainer":
+        return self
+
+    def __next__(self) -> StepResult:
+        if self._step >= self.num_iters:
+            raise StopIteration
+        cam = self._rng.choice(self._cameras)
+        downscale = self._model.get_downscale_factor(self._step)
+        cam.load_image(float(downscale))
+        rendered = self._model.forward(cam, self._step)
+        gt = cam.get_image(int(downscale))
+        loss = self._model.main_loss(rendered, gt, self._kw.ssim_weight)
+        self._model.optimizers_zero_grad()
+        loss.backward()
+        self._model.optimizers_step()
+        self._model.schedulers_step(self._step)
+        self._model.after_train(self._step)
+
+        result = StepResult(
+            step=self._step,
+            loss=float(loss.item()),
+            num_gaussians=int(self._model.means.size(0)),
+        )
+        self._step += 1
+        return result
+
+    def run(self) -> None:
+        """Drive the iterator to completion. Equivalent to `for _ in self: pass`."""
+        for _ in self:
+            pass

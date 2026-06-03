@@ -10,3 +10,18 @@ def test_trainer_constructs(colmap_mini: Path) -> None:
     assert trainer.num_iters == 10
     # device resolution: in CI we expect CPU
     assert str(trainer.device) in ("cpu", "cuda:0", "mps")
+
+
+def test_trainer_yields_step_results(colmap_mini: Path) -> None:
+    from opensplat import Trainer, StepResult
+
+    trainer = Trainer(
+        input=str(colmap_mini), num_iters=3, save_every=-1, sh_degree=1,
+        device="cpu",
+    )
+    results = list(trainer)
+    assert len(results) == 3
+    assert all(isinstance(r, StepResult) for r in results)
+    assert [r.step for r in results] == [0, 1, 2]
+    assert all(r.loss > 0 for r in results)
+    assert all(r.num_gaussians > 0 for r in results)
