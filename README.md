@@ -259,6 +259,33 @@ export HSA_OVERRIDE_GFX_VERSION=10.3.0  # AMD RX 6700 XT workaround
 cd /code/build
 ./opensplat /data/banana -n 2000
 ```
+## Python bindings
+
+Install the prebuilt wheel:
+
+```bash
+pip install opensplat
+```
+
+Minimal usage:
+
+```python
+import opensplat
+
+opensplat.train(
+    input="/path/to/colmap_or_nerfstudio_project",
+    output="scene.ply",
+    num_iters=30000,
+)
+
+# Or iterate for progress reporting / early stopping:
+trainer = opensplat.Trainer(input="...", output="scene.ply", num_iters=30000)
+for result in trainer:
+    print(f"step {result.step}: loss={result.loss:.4f}")
+```
+
+All CLI flags are available as kwargs (snake_case). See `python/opensplat/_kwargs.py` for the full list.
+
 ## Project Goals
 
 We recently released OpenSplat, so there's lots of work to do.

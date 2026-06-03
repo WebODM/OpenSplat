@@ -21,7 +21,7 @@ opensplat.train(
     input="/path/to/colmap_or_nerfstudio_project",
     output="scene.ply",
     num_iters=30000,
-    save_every=7000,
+    save_every=7000,       # default -1 = disabled
     device=None,           # None = auto-detect (cuda → mps → cpu)
     # ... all CLI flags exposed as kwargs (see "Kwargs" below) ...
 )
@@ -50,7 +50,7 @@ Flat kwargs, one per CLI flag, `snake_case`, defaults match the C++ CLI defaults
 | `input` | `str \| os.PathLike` | required | `-i` |
 | `output` | `str \| os.PathLike \| None` | `None` | `-o` |
 | `num_iters` | `int` | `30000` | `-n` |
-| `save_every` | `int` | `7000` | `--save-every` (0 disables) |
+| `save_every` | `int` | `-1` | `--save-every` (`-1` or `0` disables) |
 | `device` | `str \| None` | `None` | new (CLI uses auto) |
 | `num_downscales` | `int` | `2` | `--num-downscales` |
 | `resolution_schedule` | `int` | `3000` | `--resolution-schedule` |
@@ -63,8 +63,10 @@ Flat kwargs, one per CLI flag, `snake_case`, defaults match the C++ CLI defaults
 | `densify_size_thresh` | `float` | `0.01` | `--densify-size-thresh` |
 | `stop_screen_size_at` | `int` | `4000` | `--stop-screen-size-at` |
 | `split_screen_size` | `float` | `0.05` | `--split-screen-size` |
+| `downscale_factor` | `float` | `1.0` | `--downscale-factor` |
+| `colmap_image_path` | `str` | `""` | `--colmap-image-path` |
 | `keep_crs` | `bool` | `False` | `--keep-crs` |
-| `val` | `bool` | `False` | `--val` |
+| `val` | `bool` | `False` | `--val`. Setting `val_render` without `val=True` raises `ValueError` (the CLI auto-promotes; the Python API does not). |
 | `val_image` | `str` | `"random"` | `--val-image` |
 | `val_render` | `str \| None` | `None` | `--val-render` |
 | `ssim_weight` | `float` | `0.2` | `--ssim-weight` |
