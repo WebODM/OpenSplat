@@ -59,31 +59,38 @@ class Trainer:
         import random
         self._rng = random.Random(42)
 
-    def __iter__(self) -> "Trainer":
-        return self
+    def __iter__(self):
+        try:
+            while self._step < self.num_iters:
+                cam = self._rng.choice(self._cameras)
+                downscale = self._model.get_downscale_factor(self._step)
+                cam.load_image(float(downscale))
+                rendered = self._model.forward(cam, self._step)
+                gt = cam.get_image(int(downscale))
+                loss = self._model.main_loss(rendered, gt, self._kw.ssim_weight)
+                self._model.optimizers_zero_grad()
+                loss.backward()
+                self._model.optimizers_step()
+                self._model.schedulers_step(self._step)
+                self._model.after_train(self._step)
 
-    def __next__(self) -> StepResult:
-        if self._step >= self.num_iters:
-            raise StopIteration
-        cam = self._rng.choice(self._cameras)
-        downscale = self._model.get_downscale_factor(self._step)
-        cam.load_image(float(downscale))
-        rendered = self._model.forward(cam, self._step)
-        gt = cam.get_image(int(downscale))
-        loss = self._model.main_loss(rendered, gt, self._kw.ssim_weight)
-        self._model.optimizers_zero_grad()
-        loss.backward()
-        self._model.optimizers_step()
-        self._model.schedulers_step(self._step)
-        self._model.after_train(self._step)
+                yield StepResult(
+                    step=self._step,
+                    loss=float(loss.item()),
+                    num_gaussians=int(self._model.means.size(0)),
+                )
 
-        result = StepResult(
-            step=self._step,
-            loss=float(loss.item()),
-            num_gaussians=int(self._model.means.size(0)),
-        )
-        self._step += 1
-        return result
+                # Mid-training periodic save.
+                if (self._kw.save_every > 0
+                    and self._step > 0
+                    and self._step % self._kw.save_every == 0
+                    and self._kw.output is not None):
+                    self._model.save(str(self._kw.output), self._step)
+
+                self._step += 1
+        finally:
+            if self._kw.output is not None:
+                self._model.save(str(self._kw.output), self._step)
 
     def run(self) -> None:
         """Drive the iterator to completion. Equivalent to `for _ in self: pass`."""
