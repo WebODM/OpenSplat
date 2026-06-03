@@ -13,7 +13,7 @@ set(FETCH_DEPENDENCIES ON CACHE BOOL "Fetch additional dependencies from the Int
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # Read version
-file(READ "VERSION" APP_VERSION)
+file(READ "VERSION.txt" APP_VERSION)
 
 # Read git commit
 set(GIT_REV "")
@@ -277,6 +277,7 @@ set_target_properties(opensplat_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 target_include_directories(opensplat_core PUBLIC
+    ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/rasterizer
     ${GPU_INCLUDE_DIRS}
 )
