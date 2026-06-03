@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -101,6 +102,10 @@ class Trainer:
         self._step = 1
         self._cam_iter = _InfiniteShuffleIterator(self._cameras)
 
+        # CLI parity: opensplat.cpp creates the val-render dir up-front.
+        if self._kw.val_render is not None:
+            Path(self._kw.val_render).mkdir(parents=True, exist_ok=True)
+
     def __iter__(self):
         try:
             while self._step <= self.num_iters:
@@ -127,10 +132,40 @@ class Trainer:
                     and self._kw.output is not None):
                     self._model.save(str(self._kw.output), self._step)
 
+                # CLI parity: opensplat.cpp renders the held-out validation
+                # camera every 10 steps when --val-render is set.
+                if (self._kw.val_render is not None
+                    and self._val_cam is not None
+                    and self._step % 10 == 0):
+                    self._render_val(self._step)
+
                 self._step += 1
         finally:
             if self._kw.output is not None:
                 self._model.save(str(self._kw.output), self._step)
+                # CLI parity: opensplat.cpp writes cameras.json next to the
+                # output PLY after the loop completes (keepCrs controls whether
+                # camera positions are emitted in input CRS).
+                cameras_json = Path(self._kw.output).parent / "cameras.json"
+                self._input_data.save_cameras(str(cameras_json), self._kw.keep_crs)
+
+    def _render_val(self, step: int) -> None:
+        """Render the validation camera and write {val_render}/<step>.png.
+
+        Mirrors opensplat.cpp's val-render block: forward → HxWxC float [0,1]
+        → uint8 RGB → PNG. PIL is imported lazily so installs without it can
+        still import opensplat as long as val_render isn't used.
+        """
+        from PIL import Image
+
+        # NB: not wrapped in torch.no_grad(). Model.forward unconditionally
+        # calls retain_grad() on intermediate tensors and asserts requires_grad,
+        # so disabling autograd raises. CLI parity: opensplat.cpp also calls
+        # model.forward directly here without a no_grad scope.
+        rgb = self._model.forward(self._val_cam, step)
+        arr = (rgb.detach().cpu().clamp(0.0, 1.0) * 255.0).to(torch.uint8).numpy()
+        out_path = Path(self._kw.val_render) / f"{step}.png"
+        Image.fromarray(arr).save(str(out_path))
 
     def run(self) -> None:
         """Drive the iterator to completion. Equivalent to `for _ in self: pass`."""

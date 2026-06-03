@@ -63,6 +63,9 @@ PYBIND11_MODULE(_core, m) {
              },
              py::arg("validate") = false,
              py::arg("val_image") = std::string("random"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_cameras", &InputData::saveCameras,
+             py::arg("filename"), py::arg("keep_crs"),
              py::call_guard<py::gil_scoped_release>());
 
     py::class_<Model>(m, "Model")

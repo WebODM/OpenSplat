@@ -40,6 +40,7 @@ class InputData:
     def get_cameras(
         self, validate: bool = False, val_image: str = "random"
     ) -> Tuple[List[Camera], Optional[Camera]]: ...
+    def save_cameras(self, filename: str, keep_crs: bool) -> None: ...
 
 
 class Model:
