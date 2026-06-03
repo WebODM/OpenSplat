@@ -82,3 +82,35 @@ def test_model_constructs_from_input_data(colmap_mini: Path) -> None:
     assert model.features_dc.shape == (500, 3)
     # features_rest shape depends on sh_degree: (N, (sh+1)^2 - 1, 3)
     assert model.features_rest.shape == (500, (3 + 1) ** 2 - 1, 3)
+
+
+def test_model_one_training_step(colmap_mini: Path, tmp_output_ply: Path) -> None:
+    """One full training step: forward, loss, backward, optimizer step, save."""
+    import torch
+    from opensplat import _core
+
+    data = _core.input_data_from_path(str(colmap_mini), "")
+    cams, _val = data.get_cameras(False, "random")
+    model = _core.Model(
+        data, len(cams), 2, 3000, 3, 1000, 100, 500, 30,
+        0.0002, 0.01, 4000, 0.05, 200, False,
+        torch.device("cpu"),
+    )
+    cam = cams[0]
+    downscale = model.get_downscale_factor(0)
+    cam.load_image(downscale)
+
+    rgb = model.forward(cam, 0)
+    assert rgb.dim() == 3 and rgb.shape[2] == 3  # H, W, 3
+    gt = cam.get_image(downscale)
+    loss = model.main_loss(rgb, gt, 0.2)
+    assert float(loss.item()) > 0
+
+    model.optimizers_zero_grad()
+    loss.backward()
+    model.optimizers_step()
+    model.schedulers_step(0)
+    model.after_train(0)
+
+    model.save_ply(str(tmp_output_ply), 1)
+    assert tmp_output_ply.is_file() and tmp_output_ply.stat().st_size > 0

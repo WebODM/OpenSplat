@@ -91,7 +91,32 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("quats",         &Model::quats)
         .def_readonly("features_dc",   &Model::featuresDc)
         .def_readonly("features_rest", &Model::featuresRest)
-        .def_readonly("opacities",     &Model::opacities);
+        .def_readonly("opacities",     &Model::opacities)
+        .def("forward", &Model::forward,
+             py::arg("cam"), py::arg("step"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("main_loss", &Model::mainLoss,
+             py::arg("rendered"), py::arg("gt"), py::arg("ssim_weight"))
+        .def("optimizers_zero_grad", &Model::optimizersZeroGrad,
+             py::call_guard<py::gil_scoped_release>())
+        .def("optimizers_step", &Model::optimizersStep,
+             py::call_guard<py::gil_scoped_release>())
+        .def("schedulers_step", &Model::schedulersStep, py::arg("step"))
+        .def("get_downscale_factor", &Model::getDownscaleFactor, py::arg("step"))
+        .def("after_train", &Model::afterTrain, py::arg("step"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save", &Model::save,
+             py::arg("filename"), py::arg("step"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_ply", &Model::savePly,
+             py::arg("filename"), py::arg("step"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_splat", &Model::saveSplat,
+             py::arg("filename"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("load_ply", &Model::loadPly,
+             py::arg("filename"),
+             py::call_guard<py::gil_scoped_release>());
 
     m.def("input_data_from_path", &inputDataFromX,
           py::arg("project_root"), py::arg("colmap_image_source_path") = std::string(""),
