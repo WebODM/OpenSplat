@@ -1,0 +1,50 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.13",
+    "torch",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "opensplat"
+description = "Python bindings for OpenSplat — open-source 3D Gaussian Splatting"
+readme = "README.md"
+license = { file = "LICENSE.txt" }
+requires-python = ">=3.10"
+dynamic = ["version"]
+authors = [{ name = "OpenSplat contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "torch",
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/pierotofy/OpenSplat"
+Issues = "https://github.com/pierotofy/OpenSplat/issues"
+
+[tool.scikit-build]
+cmake.version = ">=3.21"
+wheel.packages = ["python/opensplat"]
+wheel.py-api = "cp310"
+
+[tool.scikit-build.cmake.define]
+OPENSPLAT_BUILD_PYTHON_BINDINGS = "ON"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "python/opensplat/_version.py"
+regex = '^__version__ = "(?P<value>[^"]+)"$'
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
