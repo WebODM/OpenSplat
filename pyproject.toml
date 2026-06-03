@@ -36,7 +36,9 @@ Issues = "https://github.com/pierotofy/OpenSplat/issues"
 [tool.scikit-build]
 cmake.version = ">=3.21"
 wheel.packages = ["python/opensplat"]
-wheel.py-api = "cp310"
+# No `wheel.py-api` set — pybind11_add_module without STABLE_ABI produces
+# per-interpreter .so files, so wheels are tagged cp310-cp310/cp311-cp311/etc.
+# cibuildwheel builds one wheel per Python version (see .github/workflows/wheels.yml).
 
 [tool.scikit-build.cmake.define]
 OPENSPLAT_BUILD_PYTHON_BINDINGS = "ON"

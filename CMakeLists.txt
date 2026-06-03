@@ -367,7 +367,10 @@ if(OPENSPLAT_BUILD_PYTHON_BINDINGS)
 
     pybind11_add_module(_core MODULE python/bindings.cpp)
 
-    # Cross-platform $ORIGIN-style relative-rpath marker
+    # Cross-platform $ORIGIN-style relative-rpath marker.
+    # Windows: INSTALL_RPATH is a no-op; the DLL loader does a same-directory
+    # search, which the second install(TARGETS opensplat_core ... DESTINATION
+    # opensplat) rule below already provides.
     if(APPLE)
         set(_OPENSPLAT_RPATH_ORIGIN "@loader_path")
     else()
