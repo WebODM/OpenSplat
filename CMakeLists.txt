@@ -251,48 +251,60 @@ endif()
 add_library(gsplat_cpu rasterizer/gsplat-cpu/gsplat_cpu.cpp)
 target_include_directories(gsplat_cpu PRIVATE ${TORCH_INCLUDE_DIRS})
 
-set(OPENSPLAT_SRC_FILES opensplat.cpp point_io.cpp nerfstudio.cpp model.cpp
-kdtree_tensor.cpp spherical_harmonics.cpp cv_utils.cpp utils.cpp project_gaussians.cpp
-rasterize_gaussians.cpp ssim.cpp optim_scheduler.cpp colmap.cpp opensfm.cpp openmvg.cpp input_data.cpp
-tensor_math.cpp)
+# Source files that make up the core library (everything except the CLI entry point)
+set(LIBOPENSPLAT_SRC_FILES
+    point_io.cpp nerfstudio.cpp model.cpp
+    kdtree_tensor.cpp spherical_harmonics.cpp cv_utils.cpp utils.cpp project_gaussians.cpp
+    rasterize_gaussians.cpp ssim.cpp optim_scheduler.cpp colmap.cpp opensfm.cpp openmvg.cpp input_data.cpp
+    tensor_math.cpp
+)
 
 if (OPENSPLAT_BUILD_VISUALIZER)
     if (Pangolin_FOUND)
         message(STATUS "Found Pangolin. Building visualizer (beta)")
-        list(APPEND OPENSPLAT_SRC_FILES visualizer.cpp)
+        list(APPEND LIBOPENSPLAT_SRC_FILES visualizer.cpp)
         add_definitions(-DUSE_VISUALIZATION)
     else()
         message(FATAL "Pangolin not found. Cannot build visualizer (beta)")
     endif()
 endif()
 
-add_executable(opensplat ${OPENSPLAT_SRC_FILES})
-
-install(TARGETS opensplat DESTINATION bin)
-set_property(TARGET opensplat PROPERTY CXX_STANDARD 17)
-target_include_directories(opensplat PRIVATE
+# Core library — SHARED so both the CLI and the future Python C-extension can link it
+add_library(opensplat_core SHARED ${LIBOPENSPLAT_SRC_FILES})
+set_target_properties(opensplat_core PROPERTIES
+    OUTPUT_NAME "opensplat"
+    CXX_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+)
+target_include_directories(opensplat_core PUBLIC
     ${PROJECT_SOURCE_DIR}/rasterizer
     ${GPU_INCLUDE_DIRS}
 )
-target_link_libraries(opensplat PUBLIC ${STDPPFS_LIBRARY} ${GPU_LIBRARIES} ${GSPLAT_LIBS} ${TORCH_LIBRARIES} ${OpenCV_LIBS})
+target_link_libraries(opensplat_core PUBLIC ${STDPPFS_LIBRARY} ${GPU_LIBRARIES} ${GSPLAT_LIBS} ${TORCH_LIBRARIES} ${OpenCV_LIBS})
 if (Pangolin_FOUND)
-    target_link_libraries(opensplat PUBLIC ${Pangolin_LIBRARIES})
+    target_link_libraries(opensplat_core PUBLIC ${Pangolin_LIBRARIES})
 endif()
-target_link_libraries(opensplat PRIVATE
+target_link_libraries(opensplat_core PUBLIC
     nlohmann_json::nlohmann_json
-    cxxopts::cxxopts
     nanoflann::nanoflann
 )
 if (NOT WIN32)
-    target_link_libraries(opensplat PUBLIC pthread)
+    target_link_libraries(opensplat_core PUBLIC pthread)
 endif()
 if(GPU_RUNTIME STREQUAL "HIP")
-    target_compile_definitions(opensplat PRIVATE USE_HIP __HIP_PLATFORM_AMD__)
+    target_compile_definitions(opensplat_core PUBLIC USE_HIP __HIP_PLATFORM_AMD__)
 elseif(GPU_RUNTIME STREQUAL "CUDA")
-    target_compile_definitions(opensplat PRIVATE USE_CUDA)
+    target_compile_definitions(opensplat_core PUBLIC USE_CUDA)
 elseif(GPU_RUNTIME STREQUAL "MPS")
-    target_compile_definitions(opensplat PRIVATE USE_MPS)
+    target_compile_definitions(opensplat_core PUBLIC USE_MPS)
 endif()
+
+# CLI executable — just the entry point, links the core library
+add_executable(opensplat opensplat.cpp)
+set_property(TARGET opensplat PROPERTY CXX_STANDARD 17)
+target_link_libraries(opensplat PRIVATE opensplat_core cxxopts::cxxopts)
+install(TARGETS opensplat DESTINATION bin)
+install(TARGETS opensplat_core LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 
 if(OPENSPLAT_BUILD_SIMPLE_TRAINER)
     add_executable(simple_trainer simple_trainer.cpp project_gaussians.cpp rasterize_gaussians.cpp cv_utils.cpp)
