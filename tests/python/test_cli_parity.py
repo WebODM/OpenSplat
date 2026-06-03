@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -25,16 +24,18 @@ from pathlib import Path
 import pytest
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_LOCAL_BIN = REPO_ROOT / "build-py" / "opensplat"
+
+
 pytestmark = pytest.mark.skipif(
-    not Path("build-py/opensplat").is_file()
-    and shutil.which("opensplat") is None,
+    not _LOCAL_BIN.is_file() and shutil.which("opensplat") is None,
     reason="opensplat CLI binary not found in $PATH or build-py/",
 )
 
 
 def _opensplat_binary() -> str:
-    repo_local = Path("build-py/opensplat").resolve()
-    return str(repo_local) if repo_local.is_file() else (shutil.which("opensplat") or "opensplat")
+    return str(_LOCAL_BIN) if _LOCAL_BIN.is_file() else (shutil.which("opensplat") or "opensplat")
 
 
 def _read_ply_vertex_count(path: Path) -> int:
@@ -58,8 +59,8 @@ def _omp_env() -> dict[str, str]:
     }
 
 
-def test_cli_and_python_train_match(tmp_path: Path) -> None:
-    fixture = Path("tests/fixtures/colmap_mini").resolve()
+def test_cli_and_python_train_match(colmap_mini: Path, tmp_path: Path) -> None:
+    fixture = colmap_mini
     cli_out = tmp_path / "cli.ply"
     py_out = tmp_path / "py.ply"
     env = _omp_env()
