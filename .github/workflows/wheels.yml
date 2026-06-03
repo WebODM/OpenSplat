@@ -52,3 +52,96 @@ jobs:
         with:
           name: wheels-linux-cpu
           path: wheelhouse/*.whl
+
+  linux-cuda:
+    name: Linux x86_64 CUDA 12.1
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install cibuildwheel==2.21.*
+      - name: Build wheels
+        env:
+          CIBW_BUILD: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
+          # Image bundles CUDA 12.1 toolkit + matching nvcc + libtorch CUDA build.
+          CIBW_MANYLINUX_X86_64_IMAGE: "pytorch/manylinux-cuda121"
+          CIBW_BEFORE_ALL_LINUX: "yum install -y opencv opencv-devel"
+          CIBW_BEFORE_BUILD: "pip install torch --index-url https://download.pytorch.org/whl/cu121"
+          CIBW_ENVIRONMENT: 'CMAKE_ARGS="-DGPU_RUNTIME=CUDA -DOPENSPLAT_BUILD_PYTHON_BINDINGS=ON -DOPENSPLAT_MAX_CUDA_COMPATIBILITY=ON"'
+          # No CUDA in the test runner — skip runtime tests, just confirm import works.
+          CIBW_TEST_COMMAND: 'python -c "import opensplat; print(opensplat.__version__)"'
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair -w {dest_dir} {wheel}
+            --exclude libc10.so --exclude libc10_cuda.so
+            --exclude libtorch.so --exclude libtorch_cpu.so
+            --exclude libtorch_cuda.so --exclude libtorch_python.so
+            --exclude libcudart.so.12 --exclude libnvToolsExt.so.1
+        run: python -m cibuildwheel --output-dir wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-cuda
+          path: wheelhouse/*.whl
+
+  macos-arm64:
+    name: macOS arm64 Metal
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: brew install opencv
+      - run: pip install cibuildwheel==2.21.*
+      - name: Build wheels
+        env:
+          CIBW_BUILD: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64"
+          CIBW_ARCHS_MACOS: arm64
+          CIBW_BEFORE_BUILD: "pip install torch"
+          CIBW_ENVIRONMENT: 'CMAKE_ARGS="-DGPU_RUNTIME=MPS -DOPENSPLAT_BUILD_PYTHON_BINDINGS=ON -DOPENCV_DIR=$(brew --prefix opencv)" MACOSX_DEPLOYMENT_TARGET=12.0'
+          CIBW_TEST_REQUIRES: "pytest pillow numpy"
+          CIBW_TEST_COMMAND: 'pytest {project}/tests/python/test_bindings.py -v'
+        run: python -m cibuildwheel --output-dir wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-arm64
+          path: wheelhouse/*.whl
+
+  windows-cuda:
+    name: Windows x86_64 CUDA 12.1
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: Jimver/cuda-toolkit@v0.2.16
+        id: cuda
+        with:
+          cuda: "12.1.0"
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
+      - name: Install OpenCV (vcpkg)
+        shell: pwsh
+        run: |
+          vcpkg install opencv4[core,imgproc,calib3d]:x64-windows
+          echo "OpenCV_DIR=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/share/opencv4" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - run: pip install cibuildwheel==2.21.*
+      - name: Build wheels
+        env:
+          CIBW_BUILD: "cp310-win_amd64 cp311-win_amd64 cp312-win_amd64"
+          CIBW_BEFORE_BUILD: "pip install torch --index-url https://download.pytorch.org/whl/cu121"
+          CIBW_ENVIRONMENT_WINDOWS: 'CMAKE_ARGS="-DGPU_RUNTIME=CUDA -DOPENSPLAT_BUILD_PYTHON_BINDINGS=ON -DOPENCV_DIR=$env:OpenCV_DIR"'
+          CIBW_TEST_COMMAND: 'python -c "import opensplat; print(opensplat.__version__)"'
+        run: python -m cibuildwheel --output-dir wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-cuda
+          path: wheelhouse/*.whl
