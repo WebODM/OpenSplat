@@ -366,16 +366,39 @@ if(OPENSPLAT_BUILD_PYTHON_BINDINGS)
     endif()
 
     pybind11_add_module(_core MODULE python/bindings.cpp)
+
+    # Cross-platform $ORIGIN-style relative-rpath marker
+    if(APPLE)
+        set(_OPENSPLAT_RPATH_ORIGIN "@loader_path")
+    else()
+        set(_OPENSPLAT_RPATH_ORIGIN "$ORIGIN")
+    endif()
+
     set_target_properties(_core PROPERTIES
         CXX_STANDARD 17
         # Output location matches the package layout so editable installs work.
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python/opensplat"
+        # Find libopensplat next to ourselves (same package dir) at runtime.
+        # INSTALL_RPATH_USE_LINK_PATH adds the linker's search dirs for torch/opencv,
+        # which is correct for editable/dev installs. cibuildwheel will repair this
+        # for distributed wheels.
+        INSTALL_RPATH "${_OPENSPLAT_RPATH_ORIGIN}"
+        INSTALL_RPATH_USE_LINK_PATH TRUE
     )
     target_link_libraries(_core PRIVATE opensplat_core)
     target_include_directories(_core PRIVATE ${PROJECT_SOURCE_DIR})
 
-    # Install rule for scikit-build-core: place the .so/.pyd inside the opensplat package.
+    # Install _core inside the package
     install(TARGETS _core LIBRARY DESTINATION opensplat)
+
+    # Also install libopensplat.dylib INSIDE the opensplat package directory so
+    # _core can find it via @loader_path (no need to pollute site-packages/lib).
+    # This is in addition to the standard `install(TARGETS opensplat_core ...)` rule
+    # for non-Python builds, which installs to lib/ for system consumers.
+    install(TARGETS opensplat_core
+        LIBRARY DESTINATION opensplat
+        RUNTIME DESTINATION opensplat
+    )
 endif()
 
 add_compile_definitions(GLOG_USE_GLOG_EXPORT)
