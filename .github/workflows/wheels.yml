@@ -1,0 +1,54 @@
+name: Wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "python/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/wheels.yml"
+
+jobs:
+  linux-cpu:
+    name: Linux x86_64 CPU
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: pip install cibuildwheel==2.21.*
+
+      - name: Build wheels
+        env:
+          CIBW_BUILD: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
+          CIBW_MANYLINUX_X86_64_IMAGE: "quay.io/pypa/manylinux_2_28_x86_64"
+          # OpenCV + nlohmann_json + nanoflann + glm all fetch via FetchContent
+          # in CMakeLists.txt. We only need OpenCV from the system.
+          CIBW_BEFORE_ALL_LINUX: "yum install -y opencv opencv-devel"
+          # Pin torch CPU for build + runtime
+          CIBW_BEFORE_BUILD: "pip install torch --index-url https://download.pytorch.org/whl/cpu"
+          CIBW_ENVIRONMENT: 'CMAKE_ARGS="-DGPU_RUNTIME=CPU -DOPENSPLAT_BUILD_PYTHON_BINDINGS=ON"'
+          CIBW_TEST_REQUIRES: "pytest pillow numpy"
+          CIBW_TEST_COMMAND: 'pytest {project}/tests/python/test_bindings.py -v'
+          # Repair: ensure libopensplat.so + libtorch deps are sorted out by auditwheel.
+          # Allow torch's libs to be linked dynamically (don't bundle them — they're huge
+          # and version-coupled). Matches torchvision/torchaudio convention.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair -w {dest_dir} {wheel}
+            --exclude libc10.so --exclude libtorch.so --exclude libtorch_cpu.so
+            --exclude libtorch_python.so
+        run: python -m cibuildwheel --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-cpu
+          path: wheelhouse/*.whl
