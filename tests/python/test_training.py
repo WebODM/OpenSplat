@@ -47,3 +47,12 @@ def test_trainer_saves_on_break(colmap_mini: Path, tmp_output_ply: Path) -> None
         if r.step >= 1:
             break
     assert tmp_output_ply.is_file() and tmp_output_ply.stat().st_size > 0
+
+
+def test_train_function_round_trip(colmap_mini: Path, tmp_output_ply: Path) -> None:
+    import opensplat
+    opensplat.train(
+        input=str(colmap_mini), output=str(tmp_output_ply),
+        num_iters=2, save_every=-1, sh_degree=1, device="cpu",
+    )
+    assert tmp_output_ply.is_file() and tmp_output_ply.stat().st_size > 0
