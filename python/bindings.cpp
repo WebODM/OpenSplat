@@ -8,6 +8,8 @@
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
+#include <optional>
+
 #include "input_data.hpp"
 
 namespace py = pybind11;
@@ -44,8 +46,22 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("scale",       &InputData::scale)
         .def_readonly("translation", &InputData::translation)
         .def_readonly("points",      &InputData::points)
-        .def("get_cameras", &InputData::getCameras,
-             py::arg("validate"), py::arg("val_image") = std::string("random"),
+        // Wrap getCameras: the C++ signature returns (vector<Camera>, Camera*),
+        // where Camera* is a non-owning pointer into the returned vector (or
+        // nullptr when validate=false). Returning the raw pointer to Python with
+        // pybind11's default policy would `delete` a Camera the C++ side owns.
+        // Convert to optional<Camera> (by value) so ownership is unambiguous.
+        .def("get_cameras",
+             [](InputData& self, bool validate, const std::string& val_image) {
+                 auto [cams, val_ptr] = self.getCameras(validate, val_image);
+                 std::optional<Camera> val_cam;
+                 if (val_ptr != nullptr) {
+                     val_cam = *val_ptr;
+                 }
+                 return std::make_tuple(std::move(cams), std::move(val_cam));
+             },
+             py::arg("validate") = false,
+             py::arg("val_image") = std::string("random"),
              py::call_guard<py::gil_scoped_release>());
 
     m.def("input_data_from_path", &inputDataFromX,
