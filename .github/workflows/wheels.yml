@@ -38,7 +38,7 @@ jobs:
           CIBW_BEFORE_BUILD: "pip install torch --index-url https://download.pytorch.org/whl/cpu"
           CIBW_ENVIRONMENT: 'CMAKE_ARGS="-DGPU_RUNTIME=CPU -DOPENSPLAT_BUILD_PYTHON_BINDINGS=ON"'
           CIBW_TEST_REQUIRES: "pytest pillow numpy"
-          CIBW_TEST_COMMAND: 'pytest {project}/tests/python/test_bindings.py -v'
+          CIBW_TEST_COMMAND: 'pytest {project}/tests/python/test_bindings.py {project}/tests/python/test_training.py -v'
           # Repair: ensure libopensplat.so + libtorch deps are sorted out by auditwheel.
           # Allow torch's libs to be linked dynamically (don't bundle them — they're huge
           # and version-coupled). Matches torchvision/torchaudio convention.
@@ -105,7 +105,15 @@ jobs:
           CIBW_BEFORE_BUILD: "pip install torch"
           CIBW_ENVIRONMENT: 'CMAKE_ARGS="-DGPU_RUNTIME=MPS -DOPENSPLAT_BUILD_PYTHON_BINDINGS=ON -DOPENCV_DIR=$(brew --prefix opencv)" MACOSX_DEPLOYMENT_TARGET=12.0'
           CIBW_TEST_REQUIRES: "pytest pillow numpy"
-          CIBW_TEST_COMMAND: 'pytest {project}/tests/python/test_bindings.py -v'
+          CIBW_TEST_COMMAND: 'pytest {project}/tests/python/test_bindings.py {project}/tests/python/test_training.py -v'
+          # Exclude torch dylibs from delocate-wheel: they're huge (~2GB) and
+          # version-coupled to the user's torch install. libopensplat.dylib (our
+          # own) is NOT excluded — we want it bundled.
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >-
+            delocate-wheel --require-archs arm64 -w {dest_dir} -v {wheel}
+            --exclude libc10.dylib --exclude libtorch.dylib
+            --exclude libtorch_cpu.dylib --exclude libtorch_python.dylib
+            --exclude libomp.dylib
         run: python -m cibuildwheel --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
         with:
@@ -133,13 +141,22 @@ jobs:
         run: |
           vcpkg install opencv4[core,imgproc,calib3d]:x64-windows
           echo "OpenCV_DIR=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/share/opencv4" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - run: pip install cibuildwheel==2.21.*
+      - run: pip install cibuildwheel==2.21.* delvewheel
       - name: Build wheels
         env:
           CIBW_BUILD: "cp310-win_amd64 cp311-win_amd64 cp312-win_amd64"
           CIBW_BEFORE_BUILD: "pip install torch --index-url https://download.pytorch.org/whl/cu121"
           CIBW_ENVIRONMENT_WINDOWS: 'CMAKE_ARGS="-DGPU_RUNTIME=CUDA -DOPENSPLAT_BUILD_PYTHON_BINDINGS=ON -DOPENCV_DIR=$env:OpenCV_DIR"'
           CIBW_TEST_COMMAND: 'python -c "import opensplat; print(opensplat.__version__)"'
+          # delvewheel handles Windows DLL bundling (Windows doesn't honor rpath;
+          # _core.pyd needs opensplat.dll + torch DLLs findable at import time).
+          # Exclude torch + CUDA runtime DLLs so we don't bundle the user's torch
+          # install. opensplat.dll (our own) is bundled by delvewheel automatically.
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+            delvewheel repair -w {dest_dir} {wheel}
+            --exclude torch.dll --exclude torch_cpu.dll --exclude torch_cuda.dll
+            --exclude c10.dll --exclude c10_cuda.dll --exclude torch_python.dll
+            --exclude cudart64_12.dll --exclude cudart64_110.dll
         run: python -m cibuildwheel --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
         with:
