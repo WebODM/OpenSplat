@@ -11,6 +11,7 @@
 #include <optional>
 
 #include "input_data.hpp"
+#include "model.hpp"
 
 namespace py = pybind11;
 
@@ -63,6 +64,34 @@ PYBIND11_MODULE(_core, m) {
              py::arg("validate") = false,
              py::arg("val_image") = std::string("random"),
              py::call_guard<py::gil_scoped_release>());
+
+    py::class_<Model>(m, "Model")
+        .def(py::init<const InputData&, int, int, int, int, int,
+                      int, int, int, float, float, int, float,
+                      int, bool, const torch::Device&>(),
+             py::arg("input_data"),
+             py::arg("num_cameras"),
+             py::arg("num_downscales"),
+             py::arg("resolution_schedule"),
+             py::arg("sh_degree"),
+             py::arg("sh_degree_interval"),
+             py::arg("refine_every"),
+             py::arg("warmup_length"),
+             py::arg("reset_alpha_every"),
+             py::arg("densify_grad_thresh"),
+             py::arg("densify_size_thresh"),
+             py::arg("stop_screen_size_at"),
+             py::arg("split_screen_size"),
+             py::arg("max_steps"),
+             py::arg("keep_crs"),
+             py::arg("device"),
+             py::call_guard<py::gil_scoped_release>())
+        .def_readonly("means",         &Model::means)
+        .def_readonly("scales",        &Model::scales)
+        .def_readonly("quats",         &Model::quats)
+        .def_readonly("features_dc",   &Model::featuresDc)
+        .def_readonly("features_rest", &Model::featuresRest)
+        .def_readonly("opacities",     &Model::opacities);
 
     m.def("input_data_from_path", &inputDataFromX,
           py::arg("project_root"), py::arg("colmap_image_source_path") = std::string(""),

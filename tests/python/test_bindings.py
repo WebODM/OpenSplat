@@ -51,3 +51,34 @@ def test_input_data_points(colmap_mini: Path) -> None:
     pts = data.points
     assert pts.xyz.shape == (500, 3)
     assert pts.rgb.shape == (500, 3)
+
+
+def test_model_constructs_from_input_data(colmap_mini: Path) -> None:
+    import torch
+    from opensplat import _core
+    data = _core.input_data_from_path(str(colmap_mini), "")
+    model = _core.Model(
+        data, len(data.cameras),
+        2,        # num_downscales
+        3000,     # resolution_schedule
+        3,        # sh_degree
+        1000,     # sh_degree_interval
+        100,      # refine_every
+        500,      # warmup_length
+        30,       # reset_alpha_every
+        0.0002,   # densify_grad_thresh
+        0.01,     # densify_size_thresh
+        4000,     # stop_screen_size_at
+        0.05,     # split_screen_size
+        200,      # max_steps
+        False,    # keep_crs
+        torch.device("cpu"),
+    )
+    # 500 points in fixture; means must match
+    assert model.means.shape == (500, 3)
+    assert model.scales.shape == (500, 3)
+    assert model.quats.shape == (500, 4)
+    assert model.opacities.shape == (500, 1)
+    assert model.features_dc.shape == (500, 3)
+    # features_rest shape depends on sh_degree: (N, (sh+1)^2 - 1, 3)
+    assert model.features_rest.shape == (500, (3 + 1) ** 2 - 1, 3)
