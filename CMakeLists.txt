@@ -347,4 +347,35 @@ if (MSVC)
         $<TARGET_FILE_DIR:opensplat>)
 endif (MSVC)
 
+# ---------------------------------------------------------------------------
+# Python bindings (opensplat._core C-extension)
+# ---------------------------------------------------------------------------
+option(OPENSPLAT_BUILD_PYTHON_BINDINGS "Build Python bindings (opensplat._core)" OFF)
+
+if(OPENSPLAT_BUILD_PYTHON_BINDINGS)
+    # Locate the Python interpreter scikit-build-core / the build env points us at.
+    find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+
+    if(FETCH_DEPENDENCIES)
+        FetchContent_Declare(pybind11
+            URL https://github.com/pybind/pybind11/archive/refs/tags/v2.13.6.zip
+        )
+        FetchContent_MakeAvailable(pybind11)
+    else()
+        find_package(pybind11 CONFIG REQUIRED)
+    endif()
+
+    pybind11_add_module(_core MODULE python/bindings.cpp)
+    set_target_properties(_core PROPERTIES
+        CXX_STANDARD 17
+        # Output location matches the package layout so editable installs work.
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python/opensplat"
+    )
+    target_link_libraries(_core PRIVATE opensplat_core)
+    target_include_directories(_core PRIVATE ${PROJECT_SOURCE_DIR})
+
+    # Install rule for scikit-build-core: place the .so/.pyd inside the opensplat package.
+    install(TARGETS _core LIBRARY DESTINATION opensplat)
+endif()
+
 add_compile_definitions(GLOG_USE_GLOG_EXPORT)
