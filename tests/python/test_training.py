@@ -22,9 +22,35 @@ def test_trainer_yields_step_results(colmap_mini: Path) -> None:
     results = list(trainer)
     assert len(results) == 3
     assert all(isinstance(r, StepResult) for r in results)
-    assert [r.step for r in results] == [0, 1, 2]
+    # CLI parity: opensplat.cpp iterates step=1..numIters (1-indexed).
+    assert [r.step for r in results] == [1, 2, 3]
     assert all(r.loss > 0 for r in results)
     assert all(r.num_gaussians > 0 for r in results)
+
+
+def test_camera_sampling_no_replacement() -> None:
+    """The shuffle iterator must emit each item exactly once per pass.
+
+    Mirrors the C++ InfiniteRandomIterator (utils.hpp): Fisher-Yates per pass,
+    no repeats until the queue is exhausted, then reshuffle.
+    """
+    from opensplat.trainer import _InfiniteShuffleIterator
+
+    items = ["a", "b", "c", "d"]
+    it = _InfiniteShuffleIterator(items, seed=42)
+
+    pass1 = [next(it) for _ in range(4)]
+    assert sorted(pass1) == sorted(items), "first pass must visit each item once"
+    assert len(set(pass1)) == 4, "no duplicates within a single pass"
+
+    pass2 = [next(it) for _ in range(4)]
+    assert sorted(pass2) == sorted(items), "second pass must visit each item once"
+    assert len(set(pass2)) == 4, "no duplicates within a single pass"
+
+    # Deterministic with seed.
+    it2 = _InfiniteShuffleIterator(items, seed=42)
+    pass1_repro = [next(it2) for _ in range(4)]
+    assert pass1 == pass1_repro
 
 
 def test_trainer_saves_on_normal_completion(colmap_mini: Path, tmp_output_ply: Path) -> None:

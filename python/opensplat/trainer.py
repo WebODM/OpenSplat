@@ -1,6 +1,7 @@
 """Trainer — drives the per-step training loop on top of opensplat._core.Model."""
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,37 @@ class StepResult:
     num_gaussians: int
 
 
+class _InfiniteShuffleIterator:
+    """No-replacement infinite iterator: emits each item exactly once per pass.
+
+    Mirrors the C++ ``InfiniteRandomIterator`` (utils.hpp): seed=42, Fisher-Yates
+    shuffle per pass, draw sequentially, reshuffle when exhausted.
+    """
+
+    def __init__(self, items, seed: int = 42) -> None:
+        self._items = list(items)
+        self._rng = random.Random(seed)
+        self._queue: list = []
+        self._reshuffle()
+
+    def _reshuffle(self) -> None:
+        self._queue = self._items.copy()
+        self._rng.shuffle(self._queue)
+        self._idx = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._items:
+            raise StopIteration
+        item = self._queue[self._idx]
+        self._idx += 1
+        if self._idx >= len(self._queue):
+            self._reshuffle()
+        return item
+
+
 class Trainer:
     """Iterable trainer. See `opensplat.train()` for the one-shot convenience form."""
 
@@ -32,6 +64,16 @@ class Trainer:
         self._input_data = _core.input_data_from_path(
             str(self._kw.input), self._kw.colmap_image_path
         )
+
+        # CLI parity: opensplat.cpp loads ALL cameras once with the base
+        # downscale_factor before partitioning out the validation cam. The
+        # per-step scheduler downscale is layered on top via Camera.get_image
+        # (which caches its own image pyramid). Camera::loadImage is destructive
+        # and is documented as call-once.
+        base_downscale = max(float(self._kw.downscale_factor), 1.0)
+        for cam in self._input_data.cameras:
+            cam.load_image(base_downscale)
+
         cams, val_cam = self._input_data.get_cameras(
             self._kw.val, self._kw.val_image,
         )
@@ -55,16 +97,15 @@ class Trainer:
             self._kw.keep_crs,
             self.device,
         )
-        self._step = 0
-        import random
-        self._rng = random.Random(42)
+        # CLI parity: opensplat.cpp uses 1-indexed steps (1..numIters).
+        self._step = 1
+        self._cam_iter = _InfiniteShuffleIterator(self._cameras)
 
     def __iter__(self):
         try:
-            while self._step < self.num_iters:
-                cam = self._rng.choice(self._cameras)
+            while self._step <= self.num_iters:
+                cam = next(self._cam_iter)
                 downscale = self._model.get_downscale_factor(self._step)
-                cam.load_image(float(downscale))
                 rendered = self._model.forward(cam, self._step)
                 gt = cam.get_image(int(downscale))
                 loss = self._model.main_loss(rendered, gt, self._kw.ssim_weight)
@@ -82,7 +123,6 @@ class Trainer:
 
                 # Mid-training periodic save.
                 if (self._kw.save_every > 0
-                    and self._step > 0
                     and self._step % self._kw.save_every == 0
                     and self._kw.output is not None):
                     self._model.save(str(self._kw.output), self._step)
