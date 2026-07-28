@@ -17,7 +17,7 @@ using namespace torch::autograd;
 torch::Tensor randomQuatTensor(long long n);
 torch::Tensor projectionMatrix(float zNear, float zFar, float fovX, float fovY, const torch::Device &device);
 torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt);
-torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& mask = torch::Tensor());
+torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt);
 
 struct Model{
   Model(const InputData &inputData, int numCameras,

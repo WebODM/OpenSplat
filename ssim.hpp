@@ -12,12 +12,7 @@ public:
         window = createWindow();
     };
 
-    // mask: optional (H, W) or (H, W, 1) tensor in [0, 1], same spatial size
-    // as rendered/gt. Pixels outside the masked-in (white) region don't
-    // contribute to the returned score -- an undefined (default-constructed)
-    // mask behaves exactly as before (every pixel counted).
-    torch::Tensor eval(const torch::Tensor& rendered, const torch::Tensor& gt,
-                       const torch::Tensor& mask = torch::Tensor());
+    torch::Tensor eval(const torch::Tensor& rendered, const torch::Tensor& gt);
 private:
     torch::Tensor createWindow();
     torch::Tensor gaussian(float sigma);

@@ -51,14 +51,8 @@ torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt){
     return (10.f * torch::log10(1.0 / mse));
 }
 
-torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt, const torch::Tensor& mask){
-    torch::Tensor diff = torch::abs(gt - rendered);
-    if (mask.defined()){
-        torch::Tensor m = (mask.dim() == 3 ? mask.index({"...", 0}) : mask).to(diff.device());
-        m = m.unsqueeze(-1).expand_as(diff);
-        return (diff * m).sum() / m.sum().clamp_min(1.0f);
-    }
-    return diff.mean();
+torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt){
+    return torch::abs(gt - rendered).mean();
 }
 
 void Model::setupOptimizers(){
@@ -784,7 +778,19 @@ int Model::loadPly(const std::string &filename){
 }
 
 torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, float ssimWeight, const torch::Tensor &mask){
-    torch::Tensor ssimLoss = 1.0f - ssim.eval(rgb, gt, mask);
-    torch::Tensor l1Loss = l1(rgb, gt, mask);
+    torch::Tensor target = gt;
+    if (mask.defined()){
+        // Replace the masked-out (background) pixels of the ground truth with
+        // the same flat backgroundColor the rasterizer composites onto, then
+        // run the ordinary full-frame loss below. Unlike excluding those
+        // pixels from the loss entirely, this actively penalizes any splat
+        // that bleeds past the mask silhouette, since its color no longer
+        // matches the known-flat background there -- which is what keeps
+        // mask contours sharp instead of leaking.
+        torch::Tensor m = (mask.dim() == 3 ? mask.index({"...", 0}) : mask).to(gt.device()).unsqueeze(-1);
+        target = gt * m + backgroundColor.detach() * (1.0f - m);
+    }
+    torch::Tensor ssimLoss = 1.0f - ssim.eval(rgb, target);
+    torch::Tensor l1Loss = l1(rgb, target);
     return (1.0f - ssimWeight) * l1Loss + ssimWeight * ssimLoss;
 }
