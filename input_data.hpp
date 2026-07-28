@@ -24,25 +24,31 @@ struct Camera{
     float p2 = 0;
     torch::Tensor camToWorld;
     std::string filePath = "";
+    std::string maskPath = ""; // Optional path to a foreground mask image
     CameraType cameraType = CameraType::Perspective;
 
     Camera(){};
-    Camera(int width, int height, float fx, float fy, float cx, float cy, 
+    Camera(int width, int height, float fx, float fy, float cx, float cy,
         float k1, float k2, float k3, float p1, float p2,
-        const torch::Tensor &camToWorld, const std::string &filePath) : 
-        width(width), height(height), fx(fx), fy(fy), cx(cx), cy(cy), 
+        const torch::Tensor &camToWorld, const std::string &filePath) :
+        width(width), height(height), fx(fx), fy(fy), cx(cx), cy(cy),
         k1(k1), k2(k2), k3(k3), p1(p1), p2(p2),
         camToWorld(camToWorld), filePath(filePath) {}
     torch::Tensor getIntrinsicsMatrix();
     bool hasDistortionParameters();
     std::vector<float> undistortionParameters();
     torch::Tensor getImage(int downscaleFactor);
+    torch::Tensor getMask(int downscaleFactor);
+    bool hasMask() const;
 
     void loadImage(float downscaleFactor);
+    void loadMask(float downscaleFactor);
     torch::Tensor K;
     torch::Tensor image;
+    torch::Tensor mask; // (H, W, 1) in {0, 1}, same size as image once loaded
 
     std::unordered_map<int, torch::Tensor> imagePyramids;
+    std::unordered_map<int, torch::Tensor> maskPyramids;
 };
 
 struct Points{

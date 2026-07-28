@@ -14,6 +14,63 @@
 namespace fs = std::filesystem;
 using namespace torch::indexing;
 
+// Drops points from inputData.points that are never seen projecting into a
+// masked-in (white) region of any camera that has a mask loaded. Points not
+// observed by any masked camera (e.g. behind every frustum) are kept, since
+// no camera actually voted to exclude them. This runs once on the initial
+// sparse cloud, before Model seeds gaussians from it, so gaussians are only
+// ever created where the masks say the subject is.
+static void filterPointsByMasks(InputData &inputData){
+    torch::Tensor xyz = inputData.points.xyz.to(torch::kCPU).contiguous();
+    long long n = xyz.size(0);
+    if (n == 0) return;
+
+    std::vector<uint8_t> seen(n, 0);
+    std::vector<uint8_t> keep(n, 0);
+    auto xyzAcc = xyz.accessor<float, 2>();
+
+    for (Camera &cam : inputData.cameras){
+        if (!cam.hasMask()) continue;
+
+        torch::Tensor R = cam.camToWorld.index({Slice(None, 3), Slice(None, 3)});
+        torch::Tensor T = cam.camToWorld.index({Slice(None, 3), Slice(3, 4)});
+        R = torch::matmul(R, torch::diag(torch::tensor({1.0f, -1.0f, -1.0f})));
+        torch::Tensor Rinv = R.transpose(0, 1).contiguous();
+        torch::Tensor Tinv = torch::matmul(-Rinv, T).contiguous();
+
+        auto RinvAcc = Rinv.accessor<float, 2>();
+        auto TinvAcc = Tinv.accessor<float, 2>();
+
+        torch::Tensor maskT = cam.getMask(1).contiguous();
+        auto maskAcc = maskT.accessor<float, 3>();
+
+        for (long long i = 0; i < n; i++){
+            float px = xyzAcc[i][0], py = xyzAcc[i][1], pz = xyzAcc[i][2];
+            float cx_ = RinvAcc[0][0] * px + RinvAcc[0][1] * py + RinvAcc[0][2] * pz + TinvAcc[0][0];
+            float cy_ = RinvAcc[1][0] * px + RinvAcc[1][1] * py + RinvAcc[1][2] * pz + TinvAcc[1][0];
+            float cz_ = RinvAcc[2][0] * px + RinvAcc[2][1] * py + RinvAcc[2][2] * pz + TinvAcc[2][0];
+            if (cz_ <= 1e-6f) continue;
+
+            int u = static_cast<int>(std::round(cam.fx * cx_ / cz_ + cam.cx));
+            int v = static_cast<int>(std::round(cam.fy * cy_ / cz_ + cam.cy));
+            if (u < 0 || u >= cam.width || v < 0 || v >= cam.height) continue;
+
+            seen[i] = 1;
+            if (maskAcc[v][u][0] >= 0.5f) keep[i] = 1;
+        }
+    }
+
+    std::vector<int64_t> idxs;
+    idxs.reserve(n);
+    for (long long i = 0; i < n; i++){
+        if (keep[i] || !seen[i]) idxs.push_back(i);
+    }
+
+    torch::Tensor idx = torch::tensor(idxs, torch::kInt64);
+    inputData.points.xyz = inputData.points.xyz.index_select(0, idx);
+    inputData.points.rgb = inputData.points.rgb.index_select(0, idx);
+}
+
 int main(int argc, char *argv[]){
     cxxopts::Options options("opensplat", "Open Source 3D Gaussian Splats generator - " APP_VERSION);
     options.add_options()
@@ -42,6 +99,7 @@ int main(int argc, char *argv[]){
         ("stop-screen-size-at", "Stop splitting gaussians that are larger than [split-screen-size] after these many steps", cxxopts::value<int>()->default_value("4000"))
         ("split-screen-size", "Split gaussians that are larger than this percentage of screen space", cxxopts::value<float>()->default_value("0.05"))
         ("colmap-image-path", "Override the default image path for COLMAP-based input", cxxopts::value<std::string>()->default_value(""))
+        ("masks-path", "Path to a directory of foreground mask images (one per input image, matched by filename), used to only fit gaussians within the masked-in (white) regions", cxxopts::value<std::string>()->default_value(""))
 #ifdef USE_VISUALIZATION
         ("has-visualization", "Show the visualization steps of training", cxxopts::value<bool>()->default_value("0"))
 #endif
@@ -95,6 +153,7 @@ int main(int argc, char *argv[]){
     const int stopScreenSizeAt = result["stop-screen-size-at"].as<int>();
     const float splitScreenSize = result["split-screen-size"].as<float>();
     const std::string colmapImageSourcePath = result["colmap-image-path"].as<std::string>();
+    const std::string masksPath = result["masks-path"].as<std::string>();
 #ifdef USE_VISUALIZATION
     const bool hasVisualization = result["has-visualization"].as<bool>();
 #endif
@@ -121,9 +180,41 @@ int main(int argc, char *argv[]){
     try{
         InputData inputData = inputDataFromX(projectRoot, colmapImageSourcePath);
 
+        if (!masksPath.empty()){
+            fs::path masksDir(masksPath);
+            if (!fs::exists(masksDir)){
+                std::cerr << "Masks path does not exist: " << masksPath << std::endl;
+                exit(1);
+            }
+
+            for (Camera &cam : inputData.cameras){
+                fs::path imagePath(cam.filePath);
+                for (const std::string &name : { imagePath.filename().string(), imagePath.stem().string() }){
+                    for (const std::string &ext : { ".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG" }){
+                        fs::path maskPath = masksDir / (name + ext);
+                        if (fs::exists(maskPath)){
+                            cam.maskPath = maskPath.string();
+                            break;
+                        }
+                    }
+                    if (!cam.maskPath.empty()) break;
+                }
+                if (cam.maskPath.empty()){
+                    std::cerr << "Warning: no mask found for " << cam.filePath << std::endl;
+                }
+            }
+        }
+
         parallel_for(inputData.cameras.begin(), inputData.cameras.end(), [&downScaleFactor](Camera &cam){
             cam.loadImage(downScaleFactor);
+            cam.loadMask(downScaleFactor);
         });
+
+        if (!masksPath.empty()){
+            size_t before = inputData.points.xyz.size(0);
+            filterPointsByMasks(inputData);
+            std::cout << "Masked point filtering: " << before << " -> " << inputData.points.xyz.size(0) << " points" << std::endl;
+        }
 
         // Withhold a validation camera if necessary
         auto t = inputData.getCameras(validate, valImage);
@@ -157,7 +248,10 @@ int main(int argc, char *argv[]){
             torch::Tensor gt = cam.getImage(model.getDownscaleFactor(step));
             gt = gt.to(device);
 
-            torch::Tensor mainLoss = model.mainLoss(rgb, gt, ssimWeight);
+            torch::Tensor mask;
+            if (cam.hasMask()) mask = cam.getMask(model.getDownscaleFactor(step)).to(device);
+
+            torch::Tensor mainLoss = model.mainLoss(rgb, gt, ssimWeight, mask);
             mainLoss.backward();
             
             if (step % displayStep == 0) {
@@ -203,7 +297,9 @@ int main(int argc, char *argv[]){
         if (valCam != nullptr){
             torch::Tensor rgb = model.forward(*valCam, numIters);
             torch::Tensor gt = valCam->getImage(model.getDownscaleFactor(numIters)).to(device);
-            std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rgb, gt, ssimWeight).item<float>() << std::endl; 
+            torch::Tensor valMask;
+            if (valCam->hasMask()) valMask = valCam->getMask(model.getDownscaleFactor(numIters)).to(device);
+            std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rgb, gt, ssimWeight, valMask).item<float>() << std::endl;
         }
     }catch(const std::exception &e){
         std::cerr << e.what() << std::endl;

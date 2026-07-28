@@ -13,6 +13,17 @@ cv::Mat imreadRGB(const std::string &filename){
     return cImg;
 }
 
+cv::Mat imreadMask(const std::string &filename){
+    cv::Mat mask = cv::imread(filename, cv::IMREAD_GRAYSCALE);
+
+    if (mask.empty()){
+        std::cerr << "Cannot read mask " << filename << std::endl;
+        exit(1);
+    }
+
+    return mask;
+}
+
 void imwriteRGB(const std::string &filename, const cv::Mat &image){
     cv::Mat rgb;
     cv::cvtColor(image, rgb, cv::COLOR_RGB2BGR);
@@ -46,5 +57,25 @@ cv::Mat tensorToImage(const torch::Tensor &t){
 torch::Tensor imageToTensor(const cv::Mat &image){
     torch::Tensor img = torch::from_blob(image.data, { image.rows, image.cols, image.dims + 1 }, torch::kU8);
     return (img.toType(torch::kFloat32) / 255.0f);
+}
+
+torch::Tensor maskToTensor(const cv::Mat &mask){
+    torch::Tensor m = torch::from_blob(mask.data, { mask.rows, mask.cols, 1 }, torch::kU8).clone();
+
+    // Binarize at the midpoint so anti-aliased mask edges (e.g. from a
+    // resize) don't leave the loss weighting on a partial value.
+    return (m.toType(torch::kFloat32) / 255.0f).ge(0.5f).toType(torch::kFloat32);
+}
+
+cv::Mat tensorToMask(const torch::Tensor &t){
+    int h = t.size(0);
+    int w = t.size(1);
+
+    cv::Mat mask(h, w, CV_8UC1);
+    torch::Tensor scaledTensor = (t.squeeze(-1) * 255.0).toType(torch::kU8).contiguous();
+    uint8_t* dataPtr = static_cast<uint8_t*>(scaledTensor.data_ptr());
+    std::copy(dataPtr, dataPtr + (w * h), mask.data);
+
+    return mask;
 }
 

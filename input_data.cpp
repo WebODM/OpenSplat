@@ -116,6 +116,40 @@ torch::Tensor Camera::getImage(int downscaleFactor){
     }
 }
 
+void Camera::loadMask(float downscaleFactor){
+    // Populates mask, resized to match the (already downscaled/undistorted)
+    // image dimensions set by loadImage. Must be called after loadImage.
+    if (maskPath.empty()) return;
+    if (mask.numel()) std::runtime_error("loadMask already called");
+    std::cout << "Loading mask " << maskPath << std::endl;
+
+    cv::Mat cMask = imreadMask(maskPath);
+    if (cMask.rows != height || cMask.cols != width){
+        cv::resize(cMask, cMask, cv::Size(width, height), 0.0, 0.0, cv::INTER_NEAREST);
+    }
+    mask = maskToTensor(cMask);
+}
+
+torch::Tensor Camera::getMask(int downscaleFactor){
+    if (!mask.numel()) return torch::Tensor();
+    if (downscaleFactor <= 1) return mask;
+
+    if (maskPyramids.find(downscaleFactor) != maskPyramids.end()){
+        return maskPyramids[downscaleFactor];
+    }
+
+    // Nearest-neighbor to keep the mask binary (no blended edge values).
+    cv::Mat cMask = tensorToMask(mask);
+    cv::resize(cMask, cMask, cv::Size(cMask.cols / downscaleFactor, cMask.rows / downscaleFactor), 0.0, 0.0, cv::INTER_NEAREST);
+    torch::Tensor t = maskToTensor(cMask);
+    maskPyramids[downscaleFactor] = t;
+    return t;
+}
+
+bool Camera::hasMask() const {
+    return mask.numel() > 0;
+}
+
 bool Camera::hasDistortionParameters(){
     return k1 != 0.0f || k2 != 0.0f || k3 != 0.0f || p1 != 0.0f || p2 != 0.0f;
 }
