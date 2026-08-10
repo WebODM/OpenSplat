@@ -53,11 +53,6 @@ include(FetchContent)
 
 set(NANOFLANN_BUILD_EXAMPLES OFF)
 set(NANOFLANN_BUILD_TESTS OFF)
-set(SPZ_BUILD_PYTHON_BINDINGS OFF)
-set(SPZ_BUILD_TOOLS OFF)
-set(SPZ_BUILD_EXTENSIONS OFF)
-set(SPZ_BUILD_WASM OFF)
-set(SPZ_SHOULD_INSTALL OFF)
 set(ZLIB_BUILD_TESTING OFF)
 set(ZLIB_BUILD_SHARED OFF)
 set(ZLIB_INSTALL OFF)
@@ -73,29 +68,19 @@ if(FETCH_DEPENDENCIES)
         URL https://github.com/jarro2783/cxxopts/archive/refs/tags/v3.2.0.zip
     )
     FetchContent_Declare(zlib
-        URL https://zlib.net/zlib-1.3.2.tar.gz
+        URL https://github.com/pierotofy/OpenSplat/releases/download/v1.1.4/zlib-1.3.2.tar.gz
     )
-    FetchContent_Declare(spz
-        URL https://github.com/nianticlabs/spz/archive/affd0ecea7fbb4c265ee119475af7ee5b2997482.zip
-    )
-    # zlib must come after spz: spz's find_package(ZLIB) would otherwise bind
-    # to the in-tree zlib target and break spz's install export
-    FetchContent_MakeAvailable(nlohmann_json nanoflann cxxopts spz zlib)
+    FetchContent_MakeAvailable(nlohmann_json nanoflann cxxopts zlib)
     set(ZLIB_LIB zlibstatic)
-
-    if (WIN32)
-        if(TARGET zlibstatic AND NOT TARGET zlib)
-            add_library(zlib ALIAS zlibstatic)
-        endif()
-    endif()
 else()
     find_package(nlohmann_json)
     find_package(nanoflann)
     find_package(cxxopts)
     find_package(ZLIB REQUIRED)
-    find_package(spz)
     set(ZLIB_LIB ZLIB::ZLIB)
 endif()
+
+add_subdirectory(vendor/spz)
 
 if((GPU_RUNTIME STREQUAL "CUDA") OR (GPU_RUNTIME STREQUAL "HIP"))
     if(FETCH_DEPENDENCIES)
