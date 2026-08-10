@@ -82,6 +82,12 @@ if(FETCH_DEPENDENCIES)
     # to the in-tree zlib target and break spz's install export
     FetchContent_MakeAvailable(nlohmann_json nanoflann cxxopts spz zlib)
     set(ZLIB_LIB zlibstatic)
+
+    if (WIN32)
+        if(TARGET zlibstatic AND NOT TARGET zlib)
+            add_library(zlib ALIAS zlibstatic)
+        endif()
+    endif()
 else()
     find_package(nlohmann_json)
     find_package(nanoflann)
