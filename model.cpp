@@ -650,12 +650,11 @@ bool Model::saveSpz(const std::string &filename){
     gaussians.colors = tensor_to_vector<float>(colorsFlat);
     gaussians.sh = tensor_to_vector<float>(shRestFlat);
 
-    auto options = spz::PackOptions{
-        .version = 3,       // V4 available but not handled by many viewers
-        .from = spz::CoordinateSystem::RUB,
-        .sh1Bits = 6,
-        .shRestBits = 5
-    };
+    spz::PackOptions options;
+    options.version = 3;       // V4 available but not handled by many viewers
+    options.from = spz::CoordinateSystem::RUB;
+    options.sh1Bits = 6;
+    options.shRestBits = 5;
     bool success = spz::saveSpz(gaussians, options, filename);
     return success;
 }
