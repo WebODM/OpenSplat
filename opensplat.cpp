@@ -160,7 +160,7 @@ int main(int argc, char *argv[]){
             
             if (step % displayStep == 0) {
                 const float percentage = static_cast<float>(step) / numIters;
-                std::cout << "Step " << step << ": " << mainLoss.item<float>() << " (" << floor(percentage * 100) << "%)" <<  std::endl;
+                std::cout << "Step " << step << ": " << mainLoss.item<float>() << " [" << floor(percentage * 100) << "%]" <<  std::endl;
             }
 
             model.optimizersStep();

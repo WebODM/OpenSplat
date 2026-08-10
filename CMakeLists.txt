@@ -58,6 +58,9 @@ set(SPZ_BUILD_TOOLS OFF)
 set(SPZ_BUILD_EXTENSIONS OFF)
 set(SPZ_BUILD_WASM OFF)
 set(SPZ_SHOULD_INSTALL OFF)
+set(ZLIB_BUILD_TESTING OFF)
+set(ZLIB_BUILD_SHARED OFF)
+set(ZLIB_INSTALL OFF)
 
 if(FETCH_DEPENDENCIES)
     FetchContent_Declare(nlohmann_json
@@ -69,15 +72,23 @@ if(FETCH_DEPENDENCIES)
     FetchContent_Declare(cxxopts
         URL https://github.com/jarro2783/cxxopts/archive/refs/tags/v3.2.0.zip
     )
+    FetchContent_Declare(zlib
+        URL https://zlib.net/zlib-1.3.2.tar.gz
+    )
     FetchContent_Declare(spz
         URL https://github.com/nianticlabs/spz/archive/affd0ecea7fbb4c265ee119475af7ee5b2997482.zip
     )
-    FetchContent_MakeAvailable(nlohmann_json nanoflann cxxopts spz)
+    # zlib must come after spz: spz's find_package(ZLIB) would otherwise bind
+    # to the in-tree zlib target and break spz's install export
+    FetchContent_MakeAvailable(nlohmann_json nanoflann cxxopts spz zlib)
+    set(ZLIB_LIB zlibstatic)
 else()
     find_package(nlohmann_json)
     find_package(nanoflann)
     find_package(cxxopts)
+    find_package(ZLIB REQUIRED)
     find_package(spz)
+    set(ZLIB_LIB ZLIB::ZLIB)
 endif()
 
 if((GPU_RUNTIME STREQUAL "CUDA") OR (GPU_RUNTIME STREQUAL "HIP"))
@@ -265,7 +276,7 @@ target_include_directories(gsplat_cpu PRIVATE ${TORCH_INCLUDE_DIRS})
 set(OPENSPLAT_SRC_FILES opensplat.cpp point_io.cpp nerfstudio.cpp model.cpp
 kdtree_tensor.cpp spherical_harmonics.cpp cv_utils.cpp utils.cpp project_gaussians.cpp
 rasterize_gaussians.cpp ssim.cpp optim_scheduler.cpp colmap.cpp opensfm.cpp openmvg.cpp input_data.cpp
-tensor_math.cpp)
+tensor_math.cpp rad.cpp)
 
 if (OPENSPLAT_BUILD_VISUALIZER)
     if (Pangolin_FOUND)
@@ -302,6 +313,7 @@ target_link_libraries(opensplat PRIVATE
     nlohmann_json::nlohmann_json
     cxxopts::cxxopts
     nanoflann::nanoflann
+    ${ZLIB_LIB}
     spz::spz
 )
 if (NOT WIN32)

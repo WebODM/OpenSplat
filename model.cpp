@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <load-spz.h>
 #include "model.hpp"
 #include "constants.hpp"
 #include "splat-types.h"
@@ -8,7 +9,7 @@
 #include "tensor_math.hpp"
 #include "gsplat.hpp"
 #include "utils.hpp"
-#include <load-spz.h>
+#include "rad.hpp"
 
 #ifdef USE_MPS
 #include <torch/mps.h>
@@ -510,6 +511,14 @@ void Model::save(const std::string &filename, int step){
         savePly(filename, step);
         std::cout << "Wrote " << filename << std::endl;
     }
+    else if (extension == ".rad") {
+        if (saveRad(filename)) {
+            std::cout << "Wrote " << filename << std::endl;
+        }
+        else {
+            std::cerr << "Failed to write " << filename << ", aborting save." << std::endl;
+        }
+    }
     else {
         bool success = saveSpz(filename);
         if (success) {
@@ -621,14 +630,14 @@ bool Model::saveSpz(const std::string &filename){
 
 
     torch::Tensor meansCpu = keepCrs ? (means.cpu() / scale) + translation : means.cpu();
-    torch::Tensor scalesCpu = keepCrs ? (scales.cpu() / scale) : scales.cpu();
-    
+    torch::Tensor scalesCpu = keepCrs ? torch::log(torch::exp(scales.cpu()) / scale) : scales.cpu();
+
     torch::Tensor meansFlat = meansCpu.flatten();
     torch::Tensor scalesFlat = scalesCpu.flatten();
     torch::Tensor colorsFlat = featuresDc.cpu().flatten(); // raw DC coefficients
     torch::Tensor opacFlat = opacities.flatten().cpu();
-    torch::Tensor quatsFlat = quats.flatten().cpu();
-    torch::Tensor shRestFlat = featuresRest.cpu().transpose(1, 2).flatten();
+    torch::Tensor quatsFlat = torch::roll(quats.cpu(), -1, 1).flatten();
+    torch::Tensor shRestFlat = featuresRest.cpu().flatten();
     
     spz::GaussianCloud gaussians;
     gaussians.numPoints = meansCpu.size(0);
@@ -649,6 +658,32 @@ bool Model::saveSpz(const std::string &filename){
     };
     bool success = spz::saveSpz(gaussians, options, filename);
     return success;
+}
+
+bool Model::saveRad(const std::string &filename){
+    size_t numPoints = means.size(0);
+
+    // Same value preparation as savePly; rad.cpp expects exactly the values
+    // a saved PLY would contain
+    torch::Tensor meansCpu = (keepCrs ? (means.cpu() / scale) + translation : means.cpu()).contiguous();
+    torch::Tensor featuresDcCpu = featuresDc.cpu().contiguous();
+    // featuresRest [N, K, 3] coefficient-major matches rad's SH layout; no transpose
+    torch::Tensor featuresRestCpu = featuresRest.cpu().contiguous();
+    torch::Tensor opacitiesCpu = opacities.cpu().contiguous();
+    torch::Tensor scalesCpu = (keepCrs ? torch::log(torch::exp(scales.cpu()) / scale) : scales.cpu()).contiguous();
+    torch::Tensor quatsCpu = quats.cpu().contiguous();
+
+    rad::SplatData data;
+    data.numPoints = numPoints;
+    data.numRestCoeffs = featuresRest.size(1);
+    data.means = tensor_to_vector<float>(meansCpu);
+    data.featuresDc = tensor_to_vector<float>(featuresDcCpu);
+    data.featuresRest = tensor_to_vector<float>(featuresRestCpu);
+    data.opacities = tensor_to_vector<float>(opacitiesCpu);
+    data.scales = tensor_to_vector<float>(scalesCpu);
+    data.quats = tensor_to_vector<float>(quatsCpu);
+
+    return rad::saveRad(filename, data);
 }
 
 void Model::saveDebugPly(const std::string &filename, int step){
