@@ -6,8 +6,7 @@
 #include <cuda_runtime.h>
 #endif
 
-#include <glm/glm.hpp>
-#include <glm/gtc/type_ptr.hpp>
+#include <tinyglm.hpp>
 #include <iostream>
 
 inline __device__ float ndc2pix(const float x, const float W, const float cx) {

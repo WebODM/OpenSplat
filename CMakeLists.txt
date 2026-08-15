@@ -53,9 +53,8 @@ add_library(cxxopts INTERFACE)
 add_library(cxxopts::cxxopts ALIAS cxxopts)
 target_include_directories(cxxopts INTERFACE ${PROJECT_SOURCE_DIR}/vendor/cxxopts)
 
-add_library(glm INTERFACE)
-add_library(glm::glm-header-only ALIAS glm)
-target_include_directories(glm INTERFACE ${PROJECT_SOURCE_DIR}/vendor)
+add_library(tinyglm INTERFACE)
+target_include_directories(tinyglm INTERFACE ${PROJECT_SOURCE_DIR}/vendor/tinyglm)
 
 add_subdirectory(vendor/miniz)
 add_subdirectory(vendor/zstd)
@@ -215,7 +214,7 @@ if((GPU_RUNTIME STREQUAL "CUDA") OR (GPU_RUNTIME STREQUAL "HIP"))
         ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
         ${TORCH_INCLUDE_DIRS}
     )
-    target_link_libraries(gsplat PUBLIC glm::glm-header-only)
+    target_link_libraries(gsplat PUBLIC tinyglm)
     set_target_properties(gsplat PROPERTIES LINKER_LANGUAGE CXX)
 elseif(GPU_RUNTIME STREQUAL "MPS")    
     add_library(gsplat rasterizer/gsplat-metal/gsplat_metal.mm)
