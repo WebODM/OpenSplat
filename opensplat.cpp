@@ -5,6 +5,7 @@
 #include "utils.hpp"
 #include "cv_utils.hpp"
 #include "constants.hpp"
+#include "zip_utils.hpp"
 #include <cxxopts.hpp>
 
 #ifdef USE_VISUALIZATION
@@ -48,7 +49,7 @@ int main(int argc, char *argv[]){
         ("version", "Print version")
         ;
     options.parse_positional({ "input" });
-    options.positional_help("[colmap/nerfstudio/opensfm/odx/openmvg project path]");
+    options.positional_help("[colmap/nerfstudio/opensfm/odx/openmvg project path or .zip archive]");
     cxxopts::ParseResult result;
     try {
         result = options.parse(argc, argv);
@@ -117,7 +118,9 @@ int main(int argc, char *argv[]){
 #endif
 
     try{
-        InputData inputData = inputDataFromX(projectRoot);
+        std::string projectPath = projectRoot;
+        if (isZipArchive(projectRoot)) projectPath = extractZipToCache(projectRoot);
+        InputData inputData = inputDataFromX(projectPath);
 
         parallel_for(inputData.cameras.begin(), inputData.cameras.end(), [&downScaleFactor](Camera &cam){
             cam.loadImage(downScaleFactor);

@@ -33,12 +33,6 @@ message("OpenSplat Version: ${DAPP_VERSION}")
 add_compile_options("-DAPP_VERSION=\"${DAPP_VERSION}\"")
 add_compile_options("-DAPP_REVISION=\"${DAPP_REVISION}\"")
 
-# Don't complain about the override from NANOFLANN_BUILD_EXAMPLES
-set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
-# Use time-of-extraction for FetchContent'ed files modification time
-if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
-    cmake_policy(SET CMP0135 NEW)
-endif()
 # Suppress warning #20012-D (nvcc and glm)
 set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} -diag-suppress=20012)
 if(OPENSPLAT_USE_FAST_MATH)
@@ -46,66 +40,26 @@ if(OPENSPLAT_USE_FAST_MATH)
     set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} --use_fast_math)
 endif()
 
-# Fetch/find additional dependencies
-include(FetchContent)
+# Vendor deps
+add_library(nlohmann_json INTERFACE)
+add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+target_include_directories(nlohmann_json INTERFACE ${PROJECT_SOURCE_DIR}/vendor)
 
-set(NANOFLANN_BUILD_EXAMPLES OFF)
-set(NANOFLANN_BUILD_TESTS OFF)
-set(ZLIB_BUILD_TESTING OFF)
-set(ZLIB_BUILD_SHARED OFF)
-set(ZLIB_INSTALL OFF)
+add_library(nanoflann INTERFACE)
+add_library(nanoflann::nanoflann ALIAS nanoflann)
+target_include_directories(nanoflann INTERFACE ${PROJECT_SOURCE_DIR}/vendor/nanoflann)
 
-find_package(nlohmann_json QUIET)
-if(NOT nlohmann_json_FOUND)
-    message(STATUS "nlohmann_json not found, fetching it")
-    FetchContent_Declare(nlohmann_json
-        URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.zip
-    )
-    FetchContent_MakeAvailable(nlohmann_json)
-endif()
+add_library(cxxopts INTERFACE)
+add_library(cxxopts::cxxopts ALIAS cxxopts)
+target_include_directories(cxxopts INTERFACE ${PROJECT_SOURCE_DIR}/vendor/cxxopts)
 
-find_package(nanoflann QUIET)
-if(NOT nanoflann_FOUND)
-    message(STATUS "nanoflann not found, fetching it")
-    FetchContent_Declare(nanoflann
-        URL https://github.com/jlblancoc/nanoflann/archive/refs/tags/v1.5.5.zip
-    )
-    FetchContent_MakeAvailable(nanoflann)
-endif()
+add_library(glm INTERFACE)
+add_library(glm::glm-header-only ALIAS glm)
+target_include_directories(glm INTERFACE ${PROJECT_SOURCE_DIR}/vendor)
 
-find_package(cxxopts QUIET)
-if(NOT cxxopts_FOUND)
-    message(STATUS "cxxopts not found, fetching it")
-    FetchContent_Declare(cxxopts
-        URL https://github.com/jarro2783/cxxopts/archive/refs/tags/v3.2.0.zip
-    )
-    FetchContent_MakeAvailable(cxxopts)
-endif()
-
-find_package(ZLIB QUIET)
-if(ZLIB_FOUND)
-    set(ZLIB_LIB ZLIB::ZLIB)
-else()
-    message(STATUS "ZLIB not found, fetching it")
-    FetchContent_Declare(zlib
-        URL https://github.com/pierotofy/OpenSplat/releases/download/v1.1.4/zlib-1.3.2.tar.gz
-    )
-    FetchContent_MakeAvailable(zlib)
-    set(ZLIB_LIB zlibstatic)
-endif()
-
+add_subdirectory(vendor/miniz)
+add_subdirectory(vendor/zstd)
 add_subdirectory(vendor/spz)
-
-if((GPU_RUNTIME STREQUAL "CUDA") OR (GPU_RUNTIME STREQUAL "HIP"))
-    find_package(glm QUIET)
-    if(NOT glm_FOUND)
-        message(STATUS "glm not found, fetching it")
-        FetchContent_Declare(glm
-            URL https://github.com/g-truc/glm/archive/refs/tags/1.0.1.zip
-        )
-        FetchContent_MakeAvailable(glm)
-    endif()
-endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel." FORCE)
@@ -296,7 +250,7 @@ target_include_directories(gsplat_cpu PRIVATE ${TORCH_INCLUDE_DIRS})
 set(OPENSPLAT_SRC_FILES opensplat.cpp point_io.cpp nerfstudio.cpp model.cpp
 kdtree_tensor.cpp spherical_harmonics.cpp cv_utils.cpp utils.cpp project_gaussians.cpp
 rasterize_gaussians.cpp ssim.cpp optim_scheduler.cpp colmap.cpp opensfm.cpp openmvg.cpp input_data.cpp
-tensor_math.cpp rad.cpp)
+tensor_math.cpp rad.cpp zip_utils.cpp)
 
 if (OPENSPLAT_BUILD_VISUALIZER)
     if (Pangolin_FOUND)
@@ -333,7 +287,7 @@ target_link_libraries(opensplat PRIVATE
     nlohmann_json::nlohmann_json
     cxxopts::cxxopts
     nanoflann::nanoflann
-    ${ZLIB_LIB}
+    miniz
     spz::spz
 )
 if (NOT WIN32)

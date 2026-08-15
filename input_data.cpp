@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include "input_data.hpp"
 #include "cv_utils.hpp"
@@ -42,8 +43,13 @@ void Camera::loadImage(float downscaleFactor){
     // Caution: this function has destructive behaviors
     // and should be called only once
     if (image.numel()) std::runtime_error("loadImage already called");
-    std::cout << "Loading " << filePath << std::endl;
-
+    
+    {
+        static std::mutex logMutex;
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::cout << "Loading " << fs::path(filePath).filename().string() << std::endl;
+    }
+    
     cv::Mat cImg = imreadRGB(filePath);
     
     float rescaleF = 1.0f;

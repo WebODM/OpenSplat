@@ -30,7 +30,7 @@ SOFTWARE.
 #include "splat-extensions.h"
 #endif
 
-#include <zlib.h>
+#include <miniz.h>
 #include <zstd.h>
 
 #include <algorithm>
@@ -145,13 +145,35 @@ struct LegacyPackedGaussiansHeader {
   uint8_t reserved = 0;
 };
 
-bool decompressGzippedImpl(
-  const uint8_t *compressed, size_t size, int32_t windowSize, std::vector<uint8_t> *out) {
+// miniz has no gzip windowBits support; parse the gzip framing manually and
+// inflate the raw deflate stream.
+bool decompressGzipped(const uint8_t *compressed, size_t size, std::vector<uint8_t> *out) {
+  if (size < 18 || compressed[0] != 0x1f || compressed[1] != 0x8b || compressed[2] != 8) {
+    return false;
+  }
+  uint8_t flags = compressed[3];
+  size_t pos = 10;
+  if (flags & 4) {  // FEXTRA
+    if (pos + 2 > size) return false;
+    uint16_t xlen = compressed[pos] | (compressed[pos + 1] << 8);
+    pos += 2 + xlen;
+  }
+  if (flags & 8) {  // FNAME
+    while (pos < size && compressed[pos] != 0) pos++;
+    pos++;
+  }
+  if (flags & 16) {  // FCOMMENT
+    while (pos < size && compressed[pos] != 0) pos++;
+    pos++;
+  }
+  if (flags & 2) pos += 2;  // FHCRC
+  if (pos >= size) return false;
+
   std::vector<uint8_t> buffer(8192);
-  z_stream stream = {};
-  stream.next_in = const_cast<Bytef *>(compressed);
-  stream.avail_in = size;
-  if (inflateInit2(&stream, windowSize) != Z_OK) {
+  mz_stream stream = {};
+  stream.next_in = compressed + pos;
+  stream.avail_in = static_cast<unsigned int>(size - pos);
+  if (mz_inflateInit2(&stream, -MZ_DEFAULT_WINDOW_BITS) != MZ_OK) {
     return false;
   }
   out->clear();
@@ -159,25 +181,19 @@ bool decompressGzippedImpl(
   bool success = false;
   while (true) {
     stream.next_out = buffer.data();
-    stream.avail_out = buffer.size();
-    int32_t res = inflate(&stream, Z_NO_FLUSH);
-    if (res != Z_OK && res != Z_STREAM_END) {
+    stream.avail_out = static_cast<unsigned int>(buffer.size());
+    int32_t res = mz_inflate(&stream, MZ_NO_FLUSH);
+    if (res != MZ_OK && res != MZ_STREAM_END) {
       break;
     }
     out->insert(out->end(), buffer.data(), buffer.data() + buffer.size() - stream.avail_out);
-    if (res == Z_STREAM_END) {
+    if (res == MZ_STREAM_END) {
       success = true;
       break;
     }
   }
-  inflateEnd(&stream);
+  mz_inflateEnd(&stream);
   return success;
-}
-
-bool decompressGzipped(const uint8_t *compressed, size_t size, std::vector<uint8_t> *out) {
-  // Here 16 means enable automatic gzip header detection; consider switching this to 32 to enable
-  // both automated gzip and zlib header detection.
-  return decompressGzippedImpl(compressed, size, 16 | MAX_WBITS, out);
 }
 
 // A read-only streambuf over a contiguous byte range, avoiding any copy.
@@ -192,30 +208,37 @@ struct membuf : std::streambuf {
 
 bool compressGzipped(const uint8_t *data, size_t size, std::vector<uint8_t> *out) {
   std::vector<uint8_t> buffer(8192);
-  z_stream stream = {};
-  if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 16 + MAX_WBITS, 9, Z_DEFAULT_STRATEGY)
-      != Z_OK) {
+  mz_stream stream = {};
+  if (mz_deflateInit2(&stream, MZ_DEFAULT_COMPRESSION, MZ_DEFLATED, -MZ_DEFAULT_WINDOW_BITS, 9,
+                      MZ_DEFAULT_STRATEGY) != MZ_OK) {
     return false;
   }
   out->clear();
   out->reserve(size / 4);
-  stream.next_in = const_cast<Bytef *>(reinterpret_cast<const Bytef *>(data));
-  stream.avail_in = static_cast<uInt>(size);
+  const uint8_t header[10] = {0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255};
+  out->insert(out->end(), header, header + sizeof(header));
+  stream.next_in = data;
+  stream.avail_in = static_cast<unsigned int>(size);
   bool success = false;
   while (true) {
     stream.next_out = buffer.data();
-    stream.avail_out = static_cast<uInt>(buffer.size());
-    int32_t res = deflate(&stream, Z_FINISH);
-    if (res != Z_OK && res != Z_STREAM_END) {
+    stream.avail_out = static_cast<unsigned int>(buffer.size());
+    int32_t res = mz_deflate(&stream, MZ_FINISH);
+    if (res != MZ_OK && res != MZ_STREAM_END) {
       break;
     }
     out->insert(out->end(), buffer.data(), buffer.data() + buffer.size() - stream.avail_out);
-    if (res == Z_STREAM_END) {
+    if (res == MZ_STREAM_END) {
       success = true;
       break;
     }
   }
-  deflateEnd(&stream);
+  mz_deflateEnd(&stream);
+  if (!success) return false;
+  uint32_t crc = static_cast<uint32_t>(mz_crc32(MZ_CRC32_INIT, data, size));
+  uint32_t isize = static_cast<uint32_t>(size);
+  for (int i = 0; i < 4; i++) out->push_back((crc >> (8 * i)) & 0xff);
+  for (int i = 0; i < 4; i++) out->push_back((isize >> (8 * i)) & 0xff);
   return success;
 }
 

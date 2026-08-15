@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <zlib.h>
+#include <miniz.h>
 #include <nlohmann/json.hpp>
 
 namespace rad {
@@ -1479,27 +1479,27 @@ bool runPipeline(const SplatData &data, GsplatArray &splats, PipelineResult &res
     return true;
 }
 
-// Deflate via zlib: raw stream (no zlib header, windowBits -15), level 6
+// Raw deflate stream (no zlib header, windowBits -15), level 6
 
 std::vector<uint8_t> compressToVec(const std::vector<uint8_t> &data){
-    z_stream strm;
+    mz_stream strm;
     std::memset(&strm, 0, sizeof(strm));
-    if (deflateInit2(&strm, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK){
+    if (mz_deflateInit2(&strm, 6, MZ_DEFLATED, -MZ_DEFAULT_WINDOW_BITS, 8, MZ_DEFAULT_STRATEGY) != MZ_OK){
         throw std::runtime_error("saveRad: deflateInit2 failed");
     }
-    uLong bound = deflateBound(&strm, static_cast<uLong>(data.size()));
+    mz_ulong bound = mz_deflateBound(&strm, static_cast<mz_ulong>(data.size()));
     std::vector<uint8_t> out(bound);
-    strm.next_in = const_cast<Bytef *>(data.data());
-    strm.avail_in = static_cast<uInt>(data.size());
+    strm.next_in = data.data();
+    strm.avail_in = static_cast<unsigned int>(data.size());
     strm.next_out = out.data();
-    strm.avail_out = static_cast<uInt>(bound);
-    int ret = deflate(&strm, Z_FINISH);
-    if (ret != Z_STREAM_END){
-        deflateEnd(&strm);
+    strm.avail_out = static_cast<unsigned int>(bound);
+    int ret = mz_deflate(&strm, MZ_FINISH);
+    if (ret != MZ_STREAM_END){
+        mz_deflateEnd(&strm);
         throw std::runtime_error("saveRad: deflate failed");
     }
     out.resize(strm.total_out);
-    deflateEnd(&strm);
+    mz_deflateEnd(&strm);
     return out;
 }
 
