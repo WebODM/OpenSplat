@@ -49,7 +49,8 @@ variable_list RasterizeGaussians::forward(AutogradContext *ctx,
             torch::Tensor background,
             torch::Tensor errorMap,
             torch::Tensor edgeMap,
-            torch::Tensor densificationInfo
+            torch::Tensor densificationInfo,
+            torch::Tensor xyAbsGrad
         ){
     
     int numPoints = xys.size(0);
@@ -92,6 +93,7 @@ variable_list RasterizeGaussians::forward(AutogradContext *ctx,
     ctx->saved_data["errorMap"] = errorMap;
     ctx->saved_data["edgeMap"] = edgeMap;
     ctx->saved_data["densificationInfo"] = densificationInfo;
+    ctx->saved_data["xyAbsGrad"] = xyAbsGrad;
     ctx->save_for_backward({ gaussianIdsSorted, tileBins, xys, conics, colors, opacity, background, finalTs, finalIdx });
 
     return { outImg, outAlpha };
@@ -105,6 +107,7 @@ tensor_list RasterizeGaussians::backward(AutogradContext *ctx, tensor_list grad_
     torch::Tensor errorMap = ctx->saved_data["errorMap"].toTensor();
     torch::Tensor edgeMap = ctx->saved_data["edgeMap"].toTensor();
     torch::Tensor densificationInfo = ctx->saved_data["densificationInfo"].toTensor();
+    torch::Tensor xyAbsGrad = ctx->saved_data["xyAbsGrad"].toTensor();
 
     variable_list saved = ctx->get_saved_variables();
     torch::Tensor gaussianIdsSorted = saved[0];
@@ -122,6 +125,7 @@ tensor_list RasterizeGaussians::backward(AutogradContext *ctx, tensor_list grad_
     if (!errorMap.defined()) errorMap = torch::empty({0}, xys.options());
     if (!edgeMap.defined()) edgeMap = torch::empty({0}, xys.options());
     if (!densificationInfo.defined()) densificationInfo = torch::empty({0}, xys.options());
+    if (!xyAbsGrad.defined()) xyAbsGrad = torch::empty({0}, xys.options());
 
     auto t = rasterize_backward_tensor(imgHeight, imgWidth,
                             gaussianIdsSorted,
@@ -137,7 +141,8 @@ tensor_list RasterizeGaussians::backward(AutogradContext *ctx, tensor_list grad_
                             v_outAlpha,
                             errorMap,
                             edgeMap,
-                            densificationInfo);
+                            densificationInfo,
+                            xyAbsGrad);
 
     torch::Tensor v_xy = std::get<0>(t);
     torch::Tensor v_conic = std::get<1>(t);
@@ -157,7 +162,8 @@ tensor_list RasterizeGaussians::backward(AutogradContext *ctx, tensor_list grad_
             none, // background
             none, // errorMap
             none, // edgeMap
-            none // densificationInfo
+            none, // densificationInfo
+            none // xyAbsGrad
     };
 }
 
@@ -176,7 +182,8 @@ variable_list RasterizeGaussiansCPU::forward(AutogradContext *ctx,
             torch::Tensor background,
             torch::Tensor errorMap,
             torch::Tensor edgeMap,
-            torch::Tensor densificationInfo
+            torch::Tensor densificationInfo,
+            torch::Tensor xyAbsGrad
         ){
     
     int numPoints = xys.size(0);
@@ -204,6 +211,7 @@ variable_list RasterizeGaussiansCPU::forward(AutogradContext *ctx,
     ctx->saved_data["errorMap"] = errorMap;
     ctx->saved_data["edgeMap"] = edgeMap;
     ctx->saved_data["densificationInfo"] = densificationInfo;
+    ctx->saved_data["xyAbsGrad"] = xyAbsGrad;
     ctx->save_for_backward({ xys, conics, colors, opacity, background, cov2d, camDepths, finalTs });
 
     return { outImg, outAlpha };
@@ -217,6 +225,7 @@ tensor_list RasterizeGaussiansCPU::backward(AutogradContext *ctx, tensor_list gr
     torch::Tensor errorMap = ctx->saved_data["errorMap"].toTensor();
     torch::Tensor edgeMap = ctx->saved_data["edgeMap"].toTensor();
     torch::Tensor densificationInfo = ctx->saved_data["densificationInfo"].toTensor();
+    torch::Tensor xyAbsGrad = ctx->saved_data["xyAbsGrad"].toTensor();
     const std::vector<int32_t> *px2gid = reinterpret_cast<const std::vector<int32_t> *>(ctx->saved_data["px2gid"].toInt());
 
     variable_list saved = ctx->get_saved_variables();
@@ -234,6 +243,7 @@ tensor_list RasterizeGaussiansCPU::backward(AutogradContext *ctx, tensor_list gr
     if (!errorMap.defined()) errorMap = torch::empty({0}, xys.options());
     if (!edgeMap.defined()) edgeMap = torch::empty({0}, xys.options());
     if (!densificationInfo.defined()) densificationInfo = torch::empty({0}, xys.options());
+    if (!xyAbsGrad.defined()) xyAbsGrad = torch::empty({0}, xys.options());
 
     auto t = rasterize_backward_tensor_cpu(imgHeight, imgWidth,
                             xys,
@@ -249,7 +259,8 @@ tensor_list RasterizeGaussiansCPU::backward(AutogradContext *ctx, tensor_list gr
                             v_outAlpha,
                             errorMap,
                             edgeMap,
-                            densificationInfo);
+                            densificationInfo,
+                            xyAbsGrad);
 
     delete[] px2gid;
 
@@ -272,7 +283,8 @@ tensor_list RasterizeGaussiansCPU::backward(AutogradContext *ctx, tensor_list gr
             none, // background
             none, // errorMap
             none, // edgeMap
-            none // densificationInfo
+            none, // densificationInfo
+            none // xyAbsGrad
     };
 }
 

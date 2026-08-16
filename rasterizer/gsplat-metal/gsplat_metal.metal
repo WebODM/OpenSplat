@@ -860,9 +860,11 @@ kernel void rasterize_backward_kernel(
     constant int& num_points,
     constant int& has_densification,
     constant int& has_edge,
+    constant int& has_xy_abs,
     constant float* error_map,
     constant float* edge_map,
-    device atomic_float* densification_info, // [3, num_points]
+    device atomic_float* densification_info, // [4, num_points]
+    device atomic_float* v_xy_abs, // [num_points, 2]
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -971,6 +973,8 @@ kernel void rasterize_backward_kernel(
             float dens_w_local = 0.f;
             float dens_e_local = 0.f;
             float dens_g_local = 0.f;
+            float dens_c_local = 0.f;
+            float2 v_xy_abs_local = {0.f, 0.f};
             //initialize everything to 0, only set if the lane is valid
             if(valid){
                 // compute the current T for this gaussian
@@ -981,6 +985,7 @@ kernel void rasterize_backward_kernel(
                     dens_w_local = fac;
                     dens_e_local = fac * pix_err;
                     dens_g_local = fac * pix_edge;
+                    dens_c_local = pix_err > 0.5f ? 1.0f : 0.0f;
                 }
                 // update v_rgb for this gaussian
                 float v_alpha = 0.f;
@@ -1008,6 +1013,9 @@ kernel void rasterize_backward_kernel(
                                         0.5f * v_sigma * delta.y * delta.y};
                 v_xy_local = {v_sigma * (conic.x * delta.x + conic.y * delta.y),
                                     v_sigma * (conic.y * delta.x + conic.z * delta.y)};
+                if (has_xy_abs != 0){
+                    v_xy_abs_local = {fabs(v_xy_local.x), fabs(v_xy_local.y)};
+                }
                 v_opacity_local = vis * v_alpha;
             }
 
@@ -1019,6 +1027,10 @@ kernel void rasterize_backward_kernel(
                 dens_w_local = warpSum(dens_w_local, warp_size, wr);
                 dens_e_local = warpSum(dens_e_local, warp_size, wr);
                 dens_g_local = warpSum(dens_g_local, warp_size, wr);
+                dens_c_local = warpSum(dens_c_local, warp_size, wr);
+            }
+            if (has_xy_abs != 0){
+                v_xy_abs_local = warpSum2(v_xy_abs_local, warp_size, wr);
             }
 
             if (wr == 0) {
@@ -1041,6 +1053,11 @@ kernel void rasterize_backward_kernel(
                     atomic_fetch_add_explicit(densification_info + g, dens_w_local, memory_order_relaxed);
                     atomic_fetch_add_explicit(densification_info + num_points + g, dens_e_local, memory_order_relaxed);
                     atomic_fetch_add_explicit(densification_info + 2 * num_points + g, dens_g_local, memory_order_relaxed);
+                    atomic_fetch_add_explicit(densification_info + 3 * num_points + g, dens_c_local, memory_order_relaxed);
+                }
+                if (has_xy_abs != 0){
+                    atomic_fetch_add_explicit(v_xy_abs + 2*g + 0, v_xy_abs_local.x, memory_order_relaxed);
+                    atomic_fetch_add_explicit(v_xy_abs + 2*g + 1, v_xy_abs_local.y, memory_order_relaxed);
                 }
             }
         }

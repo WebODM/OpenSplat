@@ -280,7 +280,8 @@ std::
         const torch::Tensor &v_output_alpha,
         const torch::Tensor &error_map,
         const torch::Tensor &edge_map,
-        const torch::Tensor &densification_info
+        const torch::Tensor &densification_info,
+        const torch::Tensor &v_xy_abs
     ){
     torch::NoGradGuard noGrad;
 
@@ -313,6 +314,7 @@ std::
     float *pDinfo = densification_info.numel() > 0 ? static_cast<float *>(densification_info.data_ptr()) : nullptr;
     float *pErr = error_map.numel() > 0 ? static_cast<float *>(error_map.data_ptr()) : nullptr;
     float *pEdge = edge_map.numel() > 0 ? static_cast<float *>(edge_map.data_ptr()) : nullptr;
+    float *pXyAbs = v_xy_abs.numel() > 0 ? static_cast<float *>(v_xy_abs.data_ptr()) : nullptr;
 
     const float alphaThresh = 1.0f / 255.0f;
 
@@ -353,6 +355,7 @@ std::
                     pDinfo[gaussianId] += fac;
                     pDinfo[numPoints + gaussianId] += fac * err;
                     if (pEdge) pDinfo[2 * numPoints + gaussianId] += fac * pEdge[pixIdx];
+                    if (err > 0.5f) pDinfo[3 * numPoints + gaussianId] += 1.0f;
                 }
 
                 pv_colors[gaussianId * 3 + 0] += fac * pv_output[pixIdx * 3 + 0];
@@ -379,6 +382,10 @@ std::
 
                 pv_xy[gaussianId * 2 + 0] += v_sigma * (A * xCam + B * yCam);
                 pv_xy[gaussianId * 2 + 1] += v_sigma * (B * xCam + C * yCam);
+                if (pXyAbs){
+                    pXyAbs[gaussianId * 2 + 0] += std::fabs(v_sigma * (A * xCam + B * yCam));
+                    pXyAbs[gaussianId * 2 + 1] += std::fabs(v_sigma * (B * xCam + C * yCam));
+                }
 
                 pv_opacity[gaussianId] += vis * v_alpha;
             }

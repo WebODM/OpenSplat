@@ -35,7 +35,8 @@ public:
             torch::Tensor background,
             torch::Tensor errorMap = torch::Tensor(),
             torch::Tensor edgeMap = torch::Tensor(),
-            torch::Tensor densificationInfo = torch::Tensor());
+            torch::Tensor densificationInfo = torch::Tensor(),
+            torch::Tensor xyAbsGrad = torch::Tensor());
     static tensor_list backward(AutogradContext *ctx, tensor_list grad_outputs);
 };
 
@@ -56,7 +57,8 @@ public:
             torch::Tensor background,
             torch::Tensor errorMap = torch::Tensor(),
             torch::Tensor edgeMap = torch::Tensor(),
-            torch::Tensor densificationInfo = torch::Tensor());
+            torch::Tensor densificationInfo = torch::Tensor(),
+            torch::Tensor xyAbsGrad = torch::Tensor());
     static tensor_list backward(AutogradContext *ctx, tensor_list grad_outputs);
 };
 

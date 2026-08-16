@@ -176,10 +176,11 @@ __global__ void rasterize_backward_kernel(
     const float* __restrict__ error_map,
     const float* __restrict__ edge_map,
     float2* __restrict__ v_xy,
+    float2* __restrict__ v_xy_abs,
     float3* __restrict__ v_conic,
     float3* __restrict__ v_rgb,
     float* __restrict__ v_opacity,
-    float* __restrict__ densification_info // [3,N]: sum w, sum w*err, sum w*edge
+    float* __restrict__ densification_info // [4,N]: sum w, sum w*err, sum w*edge, count(err>0.5)
 ) {
     auto block = cg::this_thread_block();
     int32_t tile_id =
@@ -304,6 +305,8 @@ __global__ void rasterize_backward_kernel(
             float dens_w_local = 0.f;
             float dens_e_local = 0.f;
             float dens_g_local = 0.f;
+            float dens_c_local = 0.f;
+            float2 v_xy_abs_local = {0.f, 0.f};
             //initialize everything to 0, only set if the lane is valid
             if(valid){
                 // compute the current T for this gaussian
@@ -315,6 +318,7 @@ __global__ void rasterize_backward_kernel(
                     dens_w_local = fac;
                     dens_e_local = fac * pix_err;
                     dens_g_local = fac * pix_edge;
+                    dens_c_local = pix_err > 0.5f ? 1.0f : 0.0f;
                 }
                 float v_alpha = 0.f;
                 v_rgb_local = {fac * v_out.x, fac * v_out.y, fac * v_out.z};
@@ -339,8 +343,11 @@ __global__ void rasterize_backward_kernel(
                 v_conic_local = {0.5f * v_sigma * delta.x * delta.x, 
                                         0.5f * v_sigma * delta.x * delta.y, 
                                         0.5f * v_sigma * delta.y * delta.y};
-                v_xy_local = {v_sigma * (conic.x * delta.x + conic.y * delta.y), 
+                v_xy_local = {v_sigma * (conic.x * delta.x + conic.y * delta.y),
                                     v_sigma * (conic.y * delta.x + conic.z * delta.y)};
+                if (v_xy_abs != nullptr){
+                    v_xy_abs_local = {fabsf(v_xy_local.x), fabsf(v_xy_local.y)};
+                }
                 v_opacity_local = vis * v_alpha;
             }
             warpSum3(v_rgb_local, warp);
@@ -351,6 +358,10 @@ __global__ void rasterize_backward_kernel(
                 warpSum(dens_w_local, warp);
                 warpSum(dens_e_local, warp);
                 warpSum(dens_g_local, warp);
+                warpSum(dens_c_local, warp);
+            }
+            if (v_xy_abs != nullptr){
+                warpSum2(v_xy_abs_local, warp);
             }
             if (warp.thread_rank() == 0) {
                 int32_t g = id_batch[t];
@@ -374,6 +385,12 @@ __global__ void rasterize_backward_kernel(
                     atomicAdd(densification_info + g, dens_w_local);
                     atomicAdd(densification_info + num_points + g, dens_e_local);
                     atomicAdd(densification_info + 2 * num_points + g, dens_g_local);
+                    atomicAdd(densification_info + 3 * num_points + g, dens_c_local);
+                }
+                if (v_xy_abs != nullptr){
+                    float* v_xy_abs_ptr = (float*)(v_xy_abs);
+                    atomicAdd(v_xy_abs_ptr + 2*g + 0, v_xy_abs_local.x);
+                    atomicAdd(v_xy_abs_ptr + 2*g + 1, v_xy_abs_local.y);
                 }
             }
         }

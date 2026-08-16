@@ -1,4 +1,4 @@
-#include <cstdio>
+﻿#include <cstdio>
 #include <iostream>
 #include <math.h>
 #include <tuple>
@@ -182,5 +182,6 @@ std::
         const torch::Tensor &v_output_alpha,
         const torch::Tensor &error_map, // [H,W] or empty
         const torch::Tensor &edge_map, // [H,W] or empty
-        const torch::Tensor &densification_info // [3,N] accumulated in place, or empty
+        const torch::Tensor &densification_info, // [4,N] accumulated in place, or empty
+        const torch::Tensor &v_xy_abs // [N,2] accumulated in place, or empty
     );

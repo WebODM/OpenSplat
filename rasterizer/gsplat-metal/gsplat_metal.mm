@@ -798,7 +798,8 @@ std::
         const torch::Tensor &v_output_alpha,
         const torch::Tensor &error_map,
         const torch::Tensor &edge_map,
-        const torch::Tensor &densification_info
+        const torch::Tensor &densification_info,
+        const torch::Tensor &v_xy_abs
     ) {
     CHECK_INPUT(gaussians_ids_sorted);
     CHECK_INPUT(tile_bins);
@@ -827,6 +828,8 @@ std::
     torch::Tensor edgeMapBuf = edge_map.numel() > 0 ? edge_map : dummy;
     const int has_edge = edge_map.numel() > 0 ? 1 : 0;
     torch::Tensor dinfoBuf = has_dinfo ? densification_info : dummy;
+    const int has_xy_abs = v_xy_abs.numel() > 0 ? 1 : 0;
+    torch::Tensor xyAbsBuf = has_xy_abs ? v_xy_abs : dummy;
 
     // Get a reference to the command buffer for the MPS stream
     id<MTLCommandBuffer> command_buffer = torch::mps::get_command_buffer();
@@ -864,9 +867,11 @@ std::
         EncodeArg::scalar((int32_t)num_points),
         EncodeArg::scalar((int32_t)(has_dinfo ? 1 : 0)),
         EncodeArg::scalar((int32_t)has_edge),
+        EncodeArg::scalar((int32_t)has_xy_abs),
         EncodeArg::tensor(errorMapBuf),
         EncodeArg::tensor(edgeMapBuf),
-        EncodeArg::tensor(dinfoBuf)
+        EncodeArg::tensor(dinfoBuf),
+        EncodeArg::tensor(xyAbsBuf)
     });
 
     return std::make_tuple(v_xy, v_conic, v_colors, v_opacity);

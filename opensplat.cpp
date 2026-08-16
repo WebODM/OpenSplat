@@ -35,13 +35,16 @@ int main(int argc, char *argv[]){
         ("sh-degree", "Maximum spherical harmonics degree (must be > 0)", cxxopts::value<int>()->default_value("3"))
         ("sh-degree-interval", "Increase the number of spherical harmonics degree after these many steps (will not exceed [sh-degree])", cxxopts::value<int>()->default_value("1000"))
         ("ssim-weight", "Weight to apply to the structural similarity loss. Set to zero to use least absolute deviation (L1) loss only", cxxopts::value<float>()->default_value("0.2"))
-        ("refine-every", "Refine (prune/split/grow) gaussians every these many steps", cxxopts::value<int>()->default_value("200"))
-        ("stop-refine", "Stop refining gaussians after these many steps (-1 = 95% of num-iters)", cxxopts::value<int>()->default_value("-1"))
-        ("grow-until", "Grow new gaussians only until these many steps (-1 = half of num-iters)", cxxopts::value<int>()->default_value("-1"))
+        ("refine-every", "Densify/prune gaussians every these many steps", cxxopts::value<int>()->default_value("500"))
+        ("densify-from", "Start densifying gaussians after these many steps", cxxopts::value<int>()->default_value("500"))
+        ("densify-until", "Stop densifying gaussians after these many steps (-1 = min(15000, half of num-iters))", cxxopts::value<int>()->default_value("-1"))
+        ("loss-thresh", "High-error pixel threshold on the normalized L1 map for multi-view scoring", cxxopts::value<float>()->default_value("0.1"))
         ("max-gaussians", "Maximum number of gaussians (0 = unlimited)", cxxopts::value<int>()->default_value("5000000"))
         ("invert-masks", "Invert image masks (swap object/background)", cxxopts::value<bool>()->default_value("false"))
         ("no-masks", "Ignore image masks even when present", cxxopts::value<bool>()->default_value("false"))
-        ("no-edge-guidance", "Disable Canny edge guidance for densification", cxxopts::value<bool>()->default_value("false"))
+        ("stop-refine", "(deprecated, ignored)", cxxopts::value<int>()->default_value("-1"))
+        ("grow-until", "(deprecated, ignored)", cxxopts::value<int>()->default_value("-1"))
+        ("no-edge-guidance", "(deprecated, ignored)", cxxopts::value<bool>()->default_value("false"))
         ("warmup-length", "(deprecated, ignored)", cxxopts::value<int>()->default_value("500"))
         ("reset-alpha-every", "(deprecated, ignored)", cxxopts::value<int>()->default_value("30"))
         ("densify-grad-thresh", "(deprecated, ignored)", cxxopts::value<float>()->default_value("0.0002"))
@@ -93,10 +96,10 @@ int main(int argc, char *argv[]){
     const int shDegreeInterval = result["sh-degree-interval"].as<int>();
     const float ssimWeight = result["ssim-weight"].as<float>();
     const int refineEvery = result["refine-every"].as<int>();
-    int stopRefine = result["stop-refine"].as<int>();
-    if (stopRefine < 0) stopRefine = static_cast<int>(result["num-iters"].as<int>() * 0.95);
-    int growUntil = result["grow-until"].as<int>();
-    if (growUntil < 0) growUntil = result["num-iters"].as<int>() / 2;
+    const int densifyFrom = result["densify-from"].as<int>();
+    int densifyUntil = result["densify-until"].as<int>();
+    if (densifyUntil < 0) densifyUntil = (std::min)(15000, result["num-iters"].as<int>() / 2);
+    const float lossThresh = result["loss-thresh"].as<float>();
     const int maxGaussians = result["max-gaussians"].as<int>();
     const bool invertMasks = result["invert-masks"].as<bool>();
     const bool noMasks = result["no-masks"].as<bool>();
@@ -151,10 +154,11 @@ int main(int argc, char *argv[]){
         Model model(inputData,
                     cams.size(),
                     numDownscales, resolutionSchedule, shDegree, shDegreeInterval,
-                    refineEvery, stopRefine, growUntil, maxGaussians,
+                    refineEvery, densifyFrom, densifyUntil, maxGaussians,
+                    lossThresh,
                     numIters, keepCrs,
                     device);
-        model.edgeGuidance = !result["no-edge-guidance"].as<bool>();
+        model.trainCams = &cams;
 
         std::vector< size_t > camIndices( cams.size() );
         std::iota( camIndices.begin(), camIndices.end(), 0 );
@@ -170,8 +174,6 @@ int main(int argc, char *argv[]){
         for (; step <= numIters; step++){
             Camera& cam = cams[ camsIter.next() ];
 
-            model.optimizersZeroGrad();
-
             torch::Tensor rgb = model.forward(cam, step);
             torch::Tensor gt = cam.getImage(model.getDownscaleFactor(step));
             gt = gt.to(device);
@@ -186,8 +188,8 @@ int main(int argc, char *argv[]){
                 std::cout << "Step " << step << ": " << mainLoss.item<float>() << " [" << floor(percentage * 100) << "%]" <<  std::endl;
             }
 
-            bool restructured = model.afterTrain(step);
-            if (!restructured) model.optimizersStep();
+            model.afterTrain(step);
+            model.optimizerStepCadence(step);
             model.schedulersStep(step);
 
             if (saveEvery > 0 && step % saveEvery == 0){
