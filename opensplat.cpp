@@ -42,6 +42,7 @@ int main(int argc, char *argv[]){
         ("max-gaussians", "Maximum number of gaussians (0 = unlimited)", cxxopts::value<int>()->default_value("5000000"))
         ("invert-masks", "Invert image masks (swap object/background)", cxxopts::value<bool>()->default_value("false"))
         ("no-masks", "Ignore image masks even when present", cxxopts::value<bool>()->default_value("false"))
+        ("no-gpu-cache", "Do not cache images/masks on the GPU (reduces VRAM usage, slower)", cxxopts::value<bool>()->default_value("false"))
         ("stop-refine", "(deprecated, ignored)", cxxopts::value<int>()->default_value("-1"))
         ("grow-until", "(deprecated, ignored)", cxxopts::value<int>()->default_value("-1"))
         ("no-edge-guidance", "(deprecated, ignored)", cxxopts::value<bool>()->default_value("false"))
@@ -159,6 +160,7 @@ int main(int argc, char *argv[]){
                     numIters, keepCrs,
                     device);
         model.trainCams = &cams;
+        Camera::gpuCacheEnabled = !result["no-gpu-cache"].as<bool>();
 
         std::vector< size_t > camIndices( cams.size() );
         std::iota( camIndices.begin(), camIndices.end(), 0 );
@@ -175,10 +177,8 @@ int main(int argc, char *argv[]){
             Camera& cam = cams[ camsIter.next() ];
 
             torch::Tensor rgb = model.forward(cam, step);
-            torch::Tensor gt = cam.getImage(model.getDownscaleFactor(step));
-            gt = gt.to(device);
-            torch::Tensor mask = cam.getMask(model.getDownscaleFactor(step));
-            if (mask.defined() && mask.numel() > 0) mask = mask.to(device);
+            torch::Tensor gt = cam.getImageGpu(model.getDownscaleFactor(step), device);
+            torch::Tensor mask = cam.getMaskGpu(model.getDownscaleFactor(step), device);
 
             torch::Tensor mainLoss = model.mainLoss(rgb, gt, mask, ssimWeight);
             mainLoss.backward();
@@ -225,9 +225,8 @@ int main(int argc, char *argv[]){
         // Validate
         if (valCam != nullptr){
             torch::Tensor rgb = model.forward(*valCam, numIters);
-            torch::Tensor gt = valCam->getImage(model.getDownscaleFactor(numIters)).to(device);
-            torch::Tensor valMask = valCam->getMask(model.getDownscaleFactor(numIters));
-            if (valMask.defined() && valMask.numel() > 0) valMask = valMask.to(device);
+            torch::Tensor gt = valCam->getImageGpu(model.getDownscaleFactor(numIters), device);
+            torch::Tensor valMask = valCam->getMaskGpu(model.getDownscaleFactor(numIters), device);
             std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rgb, gt, valMask, ssimWeight).item<float>() << std::endl;
 
             torch::Tensor mse;

@@ -1,5 +1,14 @@
 #include <filesystem>
 #include <mutex>
+#include <atomic>
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#elif defined(USE_HIP)
+#include <hip/hip_runtime_api.h>
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <nlohmann/json.hpp>
 #include "input_data.hpp"
 #include "cv_utils.hpp"
@@ -160,6 +169,60 @@ torch::Tensor Camera::getMask(int downscaleFactor){
     m = (m.squeeze(0).squeeze(0) >= 0.5f).to(torch::kFloat32);
     maskPyramids[downscaleFactor] = m;
     return m;
+}
+
+bool Camera::gpuCacheEnabled = true;
+
+// Half the free VRAM at first use (CUDA/HIP), a quarter of system RAM on
+// Apple unified memory, 1GB otherwise
+static long long gpuCacheBudget(){
+#ifdef USE_CUDA
+    size_t freeB = 0, totalB = 0;
+    if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess){
+        return static_cast<long long>(freeB / 2);
+    }
+#elif defined(USE_HIP)
+    size_t freeB = 0, totalB = 0;
+    if (hipMemGetInfo(&freeB, &totalB) == hipSuccess){
+        return static_cast<long long>(freeB / 2);
+    }
+#endif
+#ifdef __APPLE__
+    int64_t ram = 0;
+    size_t size = sizeof(ram);
+    if (sysctlbyname("hw.memsize", &ram, &size, nullptr, 0) == 0){
+        return ram / 4;
+    }
+#endif
+    return 1LL << 30;
+}
+
+// Cache device-side tensors per camera to avoid re-uploading every iteration.
+// Budget-capped; beyond it we fall back to per-iteration uploads.
+static torch::Tensor gpuCached(std::unordered_map<int, torch::Tensor> &cache, int key,
+                               const torch::Tensor &src, const torch::Device &device){
+    if (device == torch::kCPU || !Camera::gpuCacheEnabled) return src.to(device);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    static std::atomic<long long> gpuCacheBytes{0};
+    static const long long budget = gpuCacheBudget();
+    long long bytes = src.numel() * src.element_size();
+    if (gpuCacheBytes.load() + bytes > budget) return src.to(device);
+    gpuCacheBytes += bytes;
+    torch::Tensor t = src.to(device);
+    cache[key] = t;
+    return t;
+}
+
+torch::Tensor Camera::getImageGpu(int downscaleFactor, const torch::Device &device){
+    return gpuCached(gpuImageCache, downscaleFactor, getImage(downscaleFactor), device);
+}
+
+torch::Tensor Camera::getMaskGpu(int downscaleFactor, const torch::Device &device){
+    torch::Tensor m = getMask(downscaleFactor);
+    if (!m.defined() || m.numel() == 0) return m;
+    return gpuCached(gpuMaskCache, downscaleFactor, m, device);
 }
 
 torch::Tensor Camera::getEdgeMap(int downscaleFactor){

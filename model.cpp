@@ -459,7 +459,7 @@ std::tuple<torch::Tensor, torch::Tensor> Model::computeMultiViewScores(int step,
     for (size_t v = 0; v < numViews; v++){
         Camera &cam = (*trainCams)[indices[v]];
         int ds = getDownscaleFactor(step);
-        torch::Tensor gt = cam.getImage(ds).to(device);
+        torch::Tensor gt = cam.getImageGpu(ds, device);
 
         errorMap = torch::zeros({gt.size(0), gt.size(1)}, fOpts);
         densificationInfo = torch::zeros({4, N}, fOpts);

@@ -43,6 +43,8 @@ struct Camera{
     torch::Tensor getImage(int downscaleFactor);
     torch::Tensor getMask(int downscaleFactor);
     torch::Tensor getEdgeMap(int downscaleFactor);
+    torch::Tensor getImageGpu(int downscaleFactor, const torch::Device &device);
+    torch::Tensor getMaskGpu(int downscaleFactor, const torch::Device &device);
     bool hasMask() const { return mask.numel() > 0; }
 
     void loadImage(float downscaleFactor);
@@ -53,6 +55,10 @@ struct Camera{
     std::unordered_map<int, torch::Tensor> imagePyramids;
     std::unordered_map<int, torch::Tensor> maskPyramids;
     std::unordered_map<int, torch::Tensor> edgePyramids;
+    std::unordered_map<int, torch::Tensor> gpuImageCache;
+    std::unordered_map<int, torch::Tensor> gpuMaskCache;
+
+    static bool gpuCacheEnabled;
 };
 
 struct Points{
