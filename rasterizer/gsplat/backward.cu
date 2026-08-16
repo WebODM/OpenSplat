@@ -1,4 +1,4 @@
-#include "backward.cuh"
+﻿#include "backward.cuh"
 #include "helpers.cuh"
 
 #ifdef USE_HIP
@@ -85,7 +85,7 @@ __global__ void nd_rasterize_backward_kernel(
         }
         const float opac = opacities[g];
         const float vis = __expf(-sigma);
-        const float alpha = min(0.99f, opac * vis);
+        const float alpha = min(0.999f, opac * vis);
         if (alpha < 1.f / 255.f) {
             continue;
         }
@@ -161,6 +161,7 @@ inline __device__ void warpSum(float& val, cg::thread_block_tile<32>& tile){
 __global__ void rasterize_backward_kernel(
     const dim3 tile_bounds,
     const dim3 img_size,
+    const unsigned num_points,
     const int32_t* __restrict__ gaussian_ids_sorted,
     const int2* __restrict__ tile_bins,
     const float2* __restrict__ xys,
@@ -172,10 +173,13 @@ __global__ void rasterize_backward_kernel(
     const int* __restrict__ final_index,
     const float3* __restrict__ v_output,
     const float* __restrict__ v_output_alpha,
+    const float* __restrict__ error_map,
+    const float* __restrict__ edge_map,
     float2* __restrict__ v_xy,
     float3* __restrict__ v_conic,
     float3* __restrict__ v_rgb,
-    float* __restrict__ v_opacity
+    float* __restrict__ v_opacity,
+    float* __restrict__ densification_info // [3,N]: sum w, sum w*err, sum w*edge
 ) {
     auto block = cg::this_thread_block();
     int32_t tile_id =
@@ -215,6 +219,9 @@ __global__ void rasterize_backward_kernel(
     // df/d_out for this pixel
     const float3 v_out = v_output[pix_id];
     const float v_out_alpha = v_output_alpha[pix_id];
+    const bool has_dinfo = densification_info != nullptr;
+    const float pix_err = (has_dinfo && error_map != nullptr && inside) ? error_map[pix_id] : 1.0f;
+    const float pix_edge = (has_dinfo && edge_map != nullptr && inside) ? edge_map[pix_id] : 0.0f;
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing
@@ -269,7 +276,7 @@ __global__ void rasterize_backward_kernel(
                                             conic.z * delta.y * delta.y) +
                                     conic.y * delta.x * delta.y;
                 vis = __expf(-sigma);
-                alpha = min(0.99f, opac * vis);
+                alpha = min(0.999f, opac * vis);
                 if (sigma < 0.f || alpha < 1.f / 255.f) {
                     valid = 0;
                 }
@@ -294,6 +301,9 @@ __global__ void rasterize_backward_kernel(
             float3 v_conic_local = {0.f, 0.f, 0.f};
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
+            float dens_w_local = 0.f;
+            float dens_e_local = 0.f;
+            float dens_g_local = 0.f;
             //initialize everything to 0, only set if the lane is valid
             if(valid){
                 // compute the current T for this gaussian
@@ -301,6 +311,11 @@ __global__ void rasterize_backward_kernel(
                 T *= ra;
                 // update v_rgb for this gaussian
                 const float fac = alpha * T;
+                if (has_dinfo){
+                    dens_w_local = fac;
+                    dens_e_local = fac * pix_err;
+                    dens_g_local = fac * pix_edge;
+                }
                 float v_alpha = 0.f;
                 v_rgb_local = {fac * v_out.x, fac * v_out.y, fac * v_out.z};
 
@@ -332,6 +347,11 @@ __global__ void rasterize_backward_kernel(
             warpSum3(v_conic_local, warp);
             warpSum2(v_xy_local, warp);
             warpSum(v_opacity_local, warp);
+            if (has_dinfo){
+                warpSum(dens_w_local, warp);
+                warpSum(dens_e_local, warp);
+                warpSum(dens_g_local, warp);
+            }
             if (warp.thread_rank() == 0) {
                 int32_t g = id_batch[t];
                 float* v_rgb_ptr = (float*)(v_rgb);
@@ -349,6 +369,12 @@ __global__ void rasterize_backward_kernel(
                 atomicAdd(v_xy_ptr + 2*g + 1, v_xy_local.y);
                 
                 atomicAdd(v_opacity + g, v_opacity_local);
+
+                if (has_dinfo){
+                    atomicAdd(densification_info + g, dens_w_local);
+                    atomicAdd(densification_info + num_points + g, dens_e_local);
+                    atomicAdd(densification_info + 2 * num_points + g, dens_g_local);
+                }
             }
         }
     }

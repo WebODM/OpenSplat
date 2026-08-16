@@ -579,7 +579,10 @@ std::
         const torch::Tensor &final_Ts,
         const torch::Tensor &final_idx,
         const torch::Tensor &v_output, // dL_dout_color
-        const torch::Tensor &v_output_alpha // dL_dout_alpha
+        const torch::Tensor &v_output_alpha, // dL_dout_alpha
+        const torch::Tensor &error_map, // [H,W] or empty
+        const torch::Tensor &edge_map, // [H,W] or empty
+        const torch::Tensor &densification_info // [3,N] accumulated in place, or empty
     ) {
 
     CHECK_INPUT(xys);
@@ -594,6 +597,19 @@ std::
     }
 
     const int num_points = xys.size(0);
+
+    if (densification_info.numel() > 0){
+        CHECK_INPUT(densification_info);
+        if (densification_info.size(0) != 3 || densification_info.size(1) != num_points){
+            AT_ERROR("densification_info must have dimensions (3, num_points)");
+        }
+    }
+    if (error_map.numel() > 0){
+        CHECK_INPUT(error_map);
+        if (error_map.numel() != img_height * img_width){
+            AT_ERROR("error_map must have img_height * img_width elements");
+        }
+    }
     const dim3 tile_bounds = {
         (img_width + BLOCK_X - 1) / BLOCK_X,
         (img_height + BLOCK_Y - 1) / BLOCK_Y,
@@ -612,6 +628,7 @@ std::
     rasterize_backward_kernel<<<tile_bounds, block>>>(
         tile_bounds,
         img_size,
+        num_points,
         gaussians_ids_sorted.contiguous().data_ptr<int>(),
         (int2 *)tile_bins.contiguous().data_ptr<int>(),
         (float2 *)xys.contiguous().data_ptr<float>(),
@@ -623,10 +640,13 @@ std::
         final_idx.contiguous().data_ptr<int>(),
         (float3 *)v_output.contiguous().data_ptr<float>(),
         v_output_alpha.contiguous().data_ptr<float>(),
+        error_map.numel() > 0 ? error_map.data_ptr<float>() : nullptr,
+        edge_map.numel() > 0 ? edge_map.data_ptr<float>() : nullptr,
         (float2 *)v_xy.contiguous().data_ptr<float>(),
         (float3 *)v_conic.contiguous().data_ptr<float>(),
         (float3 *)v_colors.contiguous().data_ptr<float>(),
-        v_opacity.contiguous().data_ptr<float>()
+        v_opacity.contiguous().data_ptr<float>(),
+        densification_info.numel() > 0 ? densification_info.data_ptr<float>() : nullptr
     );
 
     return std::make_tuple(v_xy, v_conic, v_colors, v_opacity);

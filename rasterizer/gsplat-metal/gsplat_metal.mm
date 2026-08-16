@@ -795,7 +795,10 @@ std::
         const torch::Tensor &final_Ts,
         const torch::Tensor &final_idx,
         const torch::Tensor &v_output, // dL_dout_color
-        const torch::Tensor &v_output_alpha
+        const torch::Tensor &v_output_alpha,
+        const torch::Tensor &error_map,
+        const torch::Tensor &edge_map,
+        const torch::Tensor &densification_info
     ) {
     CHECK_INPUT(gaussians_ids_sorted);
     CHECK_INPUT(tile_bins);
@@ -817,6 +820,13 @@ std::
     torch::Tensor v_colors =
         torch::zeros({num_points, channels}, xys.options());
     torch::Tensor v_opacity = torch::zeros({num_points, 1}, xys.options());
+
+    const bool has_dinfo = densification_info.numel() > 0;
+    torch::Tensor dummy = torch::zeros({1}, xys.options());
+    torch::Tensor errorMapBuf = error_map.numel() > 0 ? error_map : dummy;
+    torch::Tensor edgeMapBuf = edge_map.numel() > 0 ? edge_map : dummy;
+    const int has_edge = edge_map.numel() > 0 ? 1 : 0;
+    torch::Tensor dinfoBuf = has_dinfo ? densification_info : dummy;
 
     // Get a reference to the command buffer for the MPS stream
     id<MTLCommandBuffer> command_buffer = torch::mps::get_command_buffer();
@@ -850,7 +860,13 @@ std::
         EncodeArg::tensor(v_xy),
         EncodeArg::tensor(v_conic),
         EncodeArg::tensor(v_colors),
-        EncodeArg::tensor(v_opacity)
+        EncodeArg::tensor(v_opacity),
+        EncodeArg::scalar((int32_t)num_points),
+        EncodeArg::scalar((int32_t)(has_dinfo ? 1 : 0)),
+        EncodeArg::scalar((int32_t)has_edge),
+        EncodeArg::tensor(errorMapBuf),
+        EncodeArg::tensor(edgeMapBuf),
+        EncodeArg::tensor(dinfoBuf)
     });
 
     return std::make_tuple(v_xy, v_conic, v_colors, v_opacity);

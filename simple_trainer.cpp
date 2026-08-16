@@ -167,7 +167,7 @@ int main(int argc, char **argv){
                 p[4], // camDepths
                 height,
                 width,
-                background);
+                background)[0];
         }else{
             #if defined(USE_HIP) || defined(USE_CUDA) || defined(USE_MPS)
                 auto p = ProjectGaussians::apply(means, scales, 1, 
@@ -189,7 +189,7 @@ int main(int argc, char **argv){
                     torch::sigmoid(opacities),
                     height,
                     width,
-                    background);
+                    background)[0];
             #else
                 throw std::runtime_error("GPU support not built, use --cpu");
             #endif

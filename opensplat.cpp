@@ -30,18 +30,24 @@ int main(int argc, char *argv[]){
         
         ("n,num-iters", "Number of iterations to run", cxxopts::value<int>()->default_value("30000"))
         ("d,downscale-factor", "Scale input images by this factor.", cxxopts::value<float>()->default_value("1"))
-        ("num-downscales", "Number of images downscales to use. After being scaled by [downscale-factor], images are initially scaled by a further (2^[num-downscales]) and the scale is increased every [resolution-schedule]", cxxopts::value<int>()->default_value("2"))
+        ("num-downscales", "Number of images downscales to use. After being scaled by [downscale-factor], images are initially scaled by a further (2^[num-downscales]) and the scale is increased every [resolution-schedule]", cxxopts::value<int>()->default_value("0"))
         ("resolution-schedule", "Double the image resolution every these many steps", cxxopts::value<int>()->default_value("3000"))
         ("sh-degree", "Maximum spherical harmonics degree (must be > 0)", cxxopts::value<int>()->default_value("3"))
         ("sh-degree-interval", "Increase the number of spherical harmonics degree after these many steps (will not exceed [sh-degree])", cxxopts::value<int>()->default_value("1000"))
         ("ssim-weight", "Weight to apply to the structural similarity loss. Set to zero to use least absolute deviation (L1) loss only", cxxopts::value<float>()->default_value("0.2"))
-        ("refine-every", "Split/duplicate/prune gaussians every these many steps", cxxopts::value<int>()->default_value("100"))
-        ("warmup-length", "Split/duplicate/prune gaussians only after these many steps", cxxopts::value<int>()->default_value("500"))
-        ("reset-alpha-every", "Reset the opacity values of gaussians after these many refinements (not steps)", cxxopts::value<int>()->default_value("30"))
-        ("densify-grad-thresh", "Threshold of the positional gradient norm (magnitude of the loss function) which when exceeded leads to a gaussian split/duplication", cxxopts::value<float>()->default_value("0.0002"))
-        ("densify-size-thresh", "Gaussians' scales below this threshold are duplicated, otherwise split", cxxopts::value<float>()->default_value("0.01"))
-        ("stop-screen-size-at", "Stop splitting gaussians that are larger than [split-screen-size] after these many steps", cxxopts::value<int>()->default_value("4000"))
-        ("split-screen-size", "Split gaussians that are larger than this percentage of screen space", cxxopts::value<float>()->default_value("0.05"))
+        ("refine-every", "Refine (prune/split/grow) gaussians every these many steps", cxxopts::value<int>()->default_value("200"))
+        ("stop-refine", "Stop refining gaussians after these many steps (-1 = 95% of num-iters)", cxxopts::value<int>()->default_value("-1"))
+        ("grow-until", "Grow new gaussians only until these many steps (-1 = half of num-iters)", cxxopts::value<int>()->default_value("-1"))
+        ("max-gaussians", "Maximum number of gaussians (0 = unlimited)", cxxopts::value<int>()->default_value("5000000"))
+        ("invert-masks", "Invert image masks (swap object/background)", cxxopts::value<bool>()->default_value("false"))
+        ("no-masks", "Ignore image masks even when present", cxxopts::value<bool>()->default_value("false"))
+        ("no-edge-guidance", "Disable Canny edge guidance for densification", cxxopts::value<bool>()->default_value("false"))
+        ("warmup-length", "(deprecated, ignored)", cxxopts::value<int>()->default_value("500"))
+        ("reset-alpha-every", "(deprecated, ignored)", cxxopts::value<int>()->default_value("30"))
+        ("densify-grad-thresh", "(deprecated, ignored)", cxxopts::value<float>()->default_value("0.0002"))
+        ("densify-size-thresh", "(deprecated, ignored)", cxxopts::value<float>()->default_value("0.01"))
+        ("stop-screen-size-at", "(deprecated, ignored)", cxxopts::value<int>()->default_value("4000"))
+        ("split-screen-size", "(deprecated, ignored)", cxxopts::value<float>()->default_value("0.05"))
 #ifdef USE_VISUALIZATION
         ("has-visualization", "Show the visualization steps of training", cxxopts::value<bool>()->default_value("0"))
 #endif
@@ -87,12 +93,13 @@ int main(int argc, char *argv[]){
     const int shDegreeInterval = result["sh-degree-interval"].as<int>();
     const float ssimWeight = result["ssim-weight"].as<float>();
     const int refineEvery = result["refine-every"].as<int>();
-    const int warmupLength = result["warmup-length"].as<int>();
-    const int resetAlphaEvery = result["reset-alpha-every"].as<int>();
-    const float densifyGradThresh = result["densify-grad-thresh"].as<float>();
-    const float densifySizeThresh = result["densify-size-thresh"].as<float>();
-    const int stopScreenSizeAt = result["stop-screen-size-at"].as<int>();
-    const float splitScreenSize = result["split-screen-size"].as<float>();
+    int stopRefine = result["stop-refine"].as<int>();
+    if (stopRefine < 0) stopRefine = static_cast<int>(result["num-iters"].as<int>() * 0.95);
+    int growUntil = result["grow-until"].as<int>();
+    if (growUntil < 0) growUntil = result["num-iters"].as<int>() / 2;
+    const int maxGaussians = result["max-gaussians"].as<int>();
+    const bool invertMasks = result["invert-masks"].as<bool>();
+    const bool noMasks = result["no-masks"].as<bool>();
     #ifdef USE_VISUALIZATION
         const bool hasVisualization = result["has-visualization"].as<bool>();
     #endif
@@ -122,6 +129,16 @@ int main(int argc, char *argv[]){
         if (isZipArchive(projectRoot)) projectPath = extractZipToCache(projectRoot);
         InputData inputData = inputDataFromX(projectPath);
 
+        int numMasks = 0;
+        if (!noMasks){
+            for (Camera &cam : inputData.cameras){
+                cam.maskPath = findMaskPath(cam.filePath, projectPath);
+                cam.invertMask = invertMasks;
+                if (!cam.maskPath.empty()) numMasks++;
+            }
+        }
+        if (numMasks > 0) std::cout << "Found " << numMasks << " masks" << std::endl;
+
         parallel_for(inputData.cameras.begin(), inputData.cameras.end(), [&downScaleFactor](Camera &cam){
             cam.loadImage(downScaleFactor);
         });
@@ -133,10 +150,11 @@ int main(int argc, char *argv[]){
 
         Model model(inputData,
                     cams.size(),
-                    numDownscales, resolutionSchedule, shDegree, shDegreeInterval, 
-                    refineEvery, warmupLength, resetAlphaEvery, densifyGradThresh, densifySizeThresh, stopScreenSizeAt, splitScreenSize,
+                    numDownscales, resolutionSchedule, shDegree, shDegreeInterval,
+                    refineEvery, stopRefine, growUntil, maxGaussians,
                     numIters, keepCrs,
                     device);
+        model.edgeGuidance = !result["no-edge-guidance"].as<bool>();
 
         std::vector< size_t > camIndices( cams.size() );
         std::iota( camIndices.begin(), camIndices.end(), 0 );
@@ -157,8 +175,10 @@ int main(int argc, char *argv[]){
             torch::Tensor rgb = model.forward(cam, step);
             torch::Tensor gt = cam.getImage(model.getDownscaleFactor(step));
             gt = gt.to(device);
+            torch::Tensor mask = cam.getMask(model.getDownscaleFactor(step));
+            if (mask.defined() && mask.numel() > 0) mask = mask.to(device);
 
-            torch::Tensor mainLoss = model.mainLoss(rgb, gt, ssimWeight);
+            torch::Tensor mainLoss = model.mainLoss(rgb, gt, mask, ssimWeight);
             mainLoss.backward();
             
             if (step % displayStep == 0) {
@@ -166,9 +186,9 @@ int main(int argc, char *argv[]){
                 std::cout << "Step " << step << ": " << mainLoss.item<float>() << " [" << floor(percentage * 100) << "%]" <<  std::endl;
             }
 
-            model.optimizersStep();
+            bool restructured = model.afterTrain(step);
+            if (!restructured) model.optimizersStep();
             model.schedulersStep(step);
-            model.afterTrain(step);
 
             if (saveEvery > 0 && step % saveEvery == 0){
                 fs::path p(outputScene);
@@ -204,7 +224,17 @@ int main(int argc, char *argv[]){
         if (valCam != nullptr){
             torch::Tensor rgb = model.forward(*valCam, numIters);
             torch::Tensor gt = valCam->getImage(model.getDownscaleFactor(numIters)).to(device);
-            std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rgb, gt, ssimWeight).item<float>() << std::endl; 
+            torch::Tensor valMask = valCam->getMask(model.getDownscaleFactor(numIters));
+            if (valMask.defined() && valMask.numel() > 0) valMask = valMask.to(device);
+            std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rgb, gt, valMask, ssimWeight).item<float>() << std::endl;
+
+            torch::Tensor mse;
+            if (valMask.defined() && valMask.numel() > 0){
+                mse = (valMask.unsqueeze(-1) * (rgb - gt).pow(2)).sum() / (valMask.sum() * gt.size(2) + 1e-8f);
+            }else{
+                mse = (rgb - gt).pow(2).mean();
+            }
+            std::cout << valCam->filePath << " validation PSNR: " << (10.0f * torch::log10(1.0f / mse)).item<float>() << std::endl;
         }
     }catch(const std::exception &e){
         std::cerr << e.what() << std::endl;

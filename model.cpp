@@ -35,6 +35,52 @@ torch::Tensor randomQuatTensor(long long n){
     }, -1);
 }
 
+torch::Tensor identityQuatTensor(long long n){
+    torch::Tensor q = torch::zeros({n, 4});
+    q.index_put_({Slice(), 0}, 1.0f);
+    return q;
+}
+
+// MRNF scale init (port of LichtFeld compute_mrnf_knn_log_scales):
+// isotropic log-scale from the mean of the 2 nearest neighbor distances,
+// clamped by a percentile-based scene size
+torch::Tensor mrnfKnnLogScales(const torch::Tensor &xyz){
+    long long n = xyz.size(0);
+    torch::Tensor lo = std::get<0>(xyz.kthvalue((std::max)(static_cast<long long>(1), static_cast<long long>(0.125 * n)), 0));
+    torch::Tensor hi = std::get<0>(xyz.kthvalue((std::min)(n, static_cast<long long>(0.875 * n) + 1), 0));
+    torch::Tensor extents = (hi - lo) / 2.0f;
+    float medianSize = (std::max)(2.0f * extents.median().item<float>(), 0.01f);
+    float maxScale = 0.1f * medianSize;
+
+    PointsTensor pt(xyz);
+    KdTreeTensor *index = pt.getIndex<KdTreeTensor>();
+    torch::Tensor dists = torch::zeros({n, 1}, torch::kFloat32);
+    auto acc = xyz.accessor<float, 2>();
+    auto dAcc = dists.accessor<float, 2>();
+    for (long long i = 0; i < n; i++){
+        float query[3] = { acc[i][0], acc[i][1], acc[i][2] };
+        size_t retIndex[3];
+        float sqDist[3];
+        nanoflann::KNNResultSet<float, size_t> resultSet(3);
+        resultSet.init(retIndex, sqDist);
+        index->findNeighbors(resultSet, query);
+        // Skip self (distance 0), average the next two
+        float d = (std::sqrt(sqDist[1]) + std::sqrt(sqDist[2])) * 0.25f;
+        dAcc[i][0] = std::clamp(d, 1e-3f, maxScale);
+    }
+    pt.freeIndex<KdTreeTensor>();
+    return dists.log();
+}
+
+torch::Tensor gumbelTopK(const torch::Tensor &weights, int k){
+    if (k <= 0) return torch::empty({0}, torch::TensorOptions().dtype(torch::kLong).device(weights.device()));
+    torch::Tensor u = torch::rand_like(weights).clamp(1e-10f, 1.0f - 1e-7f);
+    torch::Tensor keys = torch::where(weights > 0,
+        torch::log(weights.clamp_min(1e-30f)) - torch::log(-torch::log(u)),
+        torch::full_like(weights, -1e30f));
+    return std::get<1>(keys.topk(k));
+}
+
 torch::Tensor projectionMatrix(float zNear, float zFar, float fovX, float fovY, const torch::Device &device){
     // OpenGL perspective projection matrix
     float t = zNear * std::tan(0.5f * fovY);
@@ -66,14 +112,19 @@ std::vector<T> tensor_to_vector(const torch::Tensor t){
 void Model::setupOptimizers(){
     releaseOptimizers();
 
-    meansOpt = new torch::optim::Adam({means}, torch::optim::AdamOptions(0.00016));
-    scalesOpt = new torch::optim::Adam({scales}, torch::optim::AdamOptions(0.005));
-    quatsOpt = new torch::optim::Adam({quats}, torch::optim::AdamOptions(0.001));
-    featuresDcOpt = new torch::optim::Adam({featuresDc}, torch::optim::AdamOptions(0.0025));
-    featuresRestOpt = new torch::optim::Adam({featuresRest}, torch::optim::AdamOptions(0.000125));
-    opacitiesOpt = new torch::optim::Adam({opacities}, torch::optim::AdamOptions(0.05));
+    // MRNF learning rates (LichtFeld mrnf_defaults)
+    const double eps = 1e-15;
+    meanLrUnscaled = 2e-5;
+    scaleLrCurrent = 7e-3;
+    meanLrGamma = std::pow(2e-7 / 2e-5, 1.0 / maxSteps);
+    scaleLrGamma = std::pow(5e-3 / 7e-3, 1.0 / maxSteps);
 
-    meansOptScheduler = new OptimScheduler(meansOpt, 0.0000016f, maxSteps);
+    meansOpt = new torch::optim::Adam({means}, torch::optim::AdamOptions(meanLrUnscaled).eps(eps));
+    scalesOpt = new torch::optim::Adam({scales}, torch::optim::AdamOptions(scaleLrCurrent).eps(eps));
+    quatsOpt = new torch::optim::Adam({quats}, torch::optim::AdamOptions(2e-3).eps(eps));
+    featuresDcOpt = new torch::optim::Adam({featuresDc}, torch::optim::AdamOptions(2e-3).eps(eps));
+    featuresRestOpt = new torch::optim::Adam({featuresRest}, torch::optim::AdamOptions(1e-4).eps(eps)); // sh0 / 20
+    opacitiesOpt = new torch::optim::Adam({opacities}, torch::optim::AdamOptions(0.012).eps(eps));
 }
 
 void Model::releaseOptimizers(){
@@ -83,8 +134,6 @@ void Model::releaseOptimizers(){
     RELEASE_SAFELY(featuresDcOpt);
     RELEASE_SAFELY(featuresRestOpt);
     RELEASE_SAFELY(opacitiesOpt);
-
-    RELEASE_SAFELY(meansOptScheduler);
 }
 
 
@@ -178,8 +227,11 @@ torch::Tensor Model::forward(Camera& cam, int step){
     
     xys.retain_grad();
 
-    if (radii.sum().item<float>() == 0.0f)
+    if (radii.sum().item<float>() == 0.0f){
+        lastAlpha = torch::zeros({height, width}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        errorMap = torch::Tensor();
         return backgroundColor.repeat({height, width, 1});
+    }
 
     torch::Tensor viewDirs = means.detach() - T.transpose(0, 1).to(device);
     viewDirs = viewDirs / viewDirs.norm(2, {-1}, true);
@@ -199,8 +251,21 @@ torch::Tensor Model::forward(Camera& cam, int step){
     
     rgbs = torch::clamp_min(rgbs + 0.5f, 0.0f);
 
+    auto fOpts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    torch::Tensor camEdgeMap;
+    if (step < stopRefine){
+        // Filled in-place by mainLoss before backward; the rasterizer backward reads it
+        errorMap = torch::zeros({height, width}, fOpts);
+        densificationInfo = torch::zeros({3, means.size(0)}, fOpts);
+        if (edgeGuidance) camEdgeMap = cam.getEdgeMap(getDownscaleFactor(step)).to(device).contiguous();
+    }else{
+        errorMap = torch::empty({0}, fOpts);
+        densificationInfo = torch::empty({0}, fOpts);
+    }
+    if (!camEdgeMap.defined()) camEdgeMap = torch::empty({0}, fOpts);
+
     if (device == torch::kCPU){
-        rgb = RasterizeGaussiansCPU::apply(
+        auto rast = RasterizeGaussiansCPU::apply(
                 xys,
                 radii,
                 conics,
@@ -210,10 +275,15 @@ torch::Tensor Model::forward(Camera& cam, int step){
                 camDepths,
                 height,
                 width,
-                backgroundColor);
-    }else{  
+                backgroundColor,
+                errorMap,
+                camEdgeMap,
+                densificationInfo);
+        rgb = rast[0];
+        lastAlpha = rast[1];
+    }else{
         #if defined(USE_HIP) || defined(USE_CUDA) || defined(USE_MPS)
-        rgb = RasterizeGaussians::apply(
+        auto rast = RasterizeGaussians::apply(
                 xys,
                 depths,
                 radii,
@@ -223,7 +293,12 @@ torch::Tensor Model::forward(Camera& cam, int step){
                 torch::sigmoid(opacities),
                 height,
                 width,
-                backgroundColor);
+                backgroundColor,
+                errorMap,
+                camEdgeMap,
+                densificationInfo);
+        rgb = rast[0];
+        lastAlpha = rast[1];
         #endif
     }
 
@@ -250,8 +325,15 @@ void Model::optimizersStep(){
   opacitiesOpt->step();
 }
 
+static void setOptimizerLr(torch::optim::Adam *opt, double lr){
+    static_cast<torch::optim::AdamOptions&>(opt->param_groups()[0].options()).set_lr(lr);
+}
+
 void Model::schedulersStep(int step){
-  meansOptScheduler->step(step);
+    meanLrUnscaled *= meanLrGamma;
+    scaleLrCurrent *= scaleLrGamma;
+    setOptimizerLr(scalesOpt, scaleLrCurrent);
+    if (boundsValid) setOptimizerLr(meansOpt, meanLrUnscaled * boundsMedianSize);
 }
 
 int Model::getDownscaleFactor(int step){
@@ -316,189 +398,270 @@ void Model::removeFromOptimizer(torch::optim::Adam *optimizer, const torch::Tens
     optimizer->state()[newPId] = std::move(paramState);
 }
 
-void Model::afterTrain(int step){
+void Model::zeroOptimizerRows(torch::optim::Adam *optimizer, const torch::Tensor &idcs){
+    if (idcs.numel() == 0) return;
+    torch::Tensor param = optimizer->param_groups()[0].params()[0];
+#if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR > 1
+    auto pId = param.unsafeGetTensorImpl();
+#else
+    auto pId = c10::guts::to_string(param.unsafeGetTensorImpl());
+#endif
+    auto it = optimizer->state().find(pId);
+    if (it == optimizer->state().end()) return;
+    auto &s = static_cast<torch::optim::AdamParamState&>(*it->second);
+    s.exp_avg().index_put_({idcs}, torch::zeros_like(s.exp_avg().index({idcs})));
+    s.exp_avg_sq().index_put_({idcs}, torch::zeros_like(s.exp_avg_sq().index({idcs})));
+}
+
+void Model::computeBounds(){
+    torch::NoGradGuard noGrad;
+    torch::Tensor m = means.detach();
+    if (freeMask.defined() && freeMask.numel() == m.size(0)){
+        torch::Tensor active = ~freeMask;
+        if (active.sum().item<long long>() > 1) m = m.index({active});
+    }
+    long long n = m.size(0);
+    if (n < 2){ boundsValid = false; return; }
+    torch::Tensor mc = m.cpu();
+    // 80th-percentile AABB: per-axis 10th / 90th percentile
+    torch::Tensor lo = std::get<0>(mc.kthvalue((std::max)(static_cast<long long>(1), static_cast<long long>(0.1 * n)), 0));
+    torch::Tensor hi = std::get<0>(mc.kthvalue((std::min)(n, static_cast<long long>(0.9 * n) + 1), 0));
+    torch::Tensor center = (lo + hi) / 2.0f;
+    torch::Tensor extent = (hi - lo) / 2.0f;
+    for (int i = 0; i < 3; i++) boundsCenter[i] = center[i].item<float>();
+    boundsMedianSize = (std::max)(2.0f * extent.median().item<float>(), 1e-6f);
+    boundsMaxExtent = (std::max)(extent.max().item<float>(), 1e-6f);
+    boundsValid = true;
+    refinesSinceBounds = 0;
+    setOptimizerLr(meansOpt, meanLrUnscaled * boundsMedianSize);
+}
+
+void Model::injectNoise(){
+    torch::NoGradGuard noGrad;
+    torch::Tensor w = torch::pow(1.0f - torch::sigmoid(opacities.squeeze(-1)), 150.0f)
+        * static_cast<float>(meanLrUnscaled * boundsMedianSize) * 50.0f;
+    w = w * (visCount > 0).to(torch::kFloat32);
+    torch::Tensor noise = (torch::randn_like(means) * w.unsqueeze(-1)).clamp(-boundsMedianSize, boundsMedianSize);
+    means.add_(noise);
+}
+
+bool Model::afterTrain(int step){
     torch::NoGradGuard noGrad;
 
-    // When radii.sum() == 0
-    if (!xys.grad().defined()) return;
+    if (step >= stopRefine) return false;
 
-    if (step < stopSplitAt){
-        torch::Tensor visibleMask = (radii > 0).flatten();
-        
-        torch::Tensor grads = torch::linalg_vector_norm(xys.grad().detach(), 2, { -1 }, false, torch::kFloat32);
-        if (!xysGradNorm.numel()){
-            xysGradNorm = grads;
-            visCounts = torch::ones_like(xysGradNorm);
-        }else{
-            visCounts.index_put_({visibleMask}, visCounts.index({visibleMask}) + 1);
-            xysGradNorm.index_put_({visibleMask}, grads.index({visibleMask}) + xysGradNorm.index({visibleMask}));
+    long long N = means.size(0);
+    auto fOpts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    if (!freeMask.defined() || freeMask.size(0) != N){
+        freeMask = torch::zeros({N}, torch::TensorOptions().dtype(torch::kBool).device(device));
+    }
+    if (!visCount.defined() || visCount.size(0) != N){
+        visCount = torch::zeros({N}, fOpts);
+        refineWeightMax = torch::zeros({N}, fOpts);
+        edgeScoreSum = torch::zeros({N}, fOpts);
+        edgeSampleCount = 0;
+    }
+    if (densificationInfo.defined() && densificationInfo.numel() == 3 * N){
+        visCount += densificationInfo[0];
+        refineWeightMax = torch::maximum(refineWeightMax, densificationInfo[1]);
+        if (edgeGuidance){
+            edgeScoreSum += densificationInfo[2];
+            edgeSampleCount++;
         }
-
-        if (!max2DSize.numel()){
-            max2DSize = torch::zeros_like(radii, torch::kFloat32);
-        }
-
-        torch::Tensor newRadii = radii.detach().index({visibleMask});
-        max2DSize.index_put_({visibleMask}, torch::maximum(
-                max2DSize.index({visibleMask}), newRadii / static_cast<float>( (std::max)(lastHeight, lastWidth) )
-            ));
     }
 
-    if (step % refineEvery == 0 && step > warmupLength){
-        int resetInterval = resetAlphaEvery * refineEvery;
-        bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
-        torch::Tensor splitsMask;
-        const float cullAlphaThresh = 0.1f;
+    if (boundsValid) injectNoise();
 
-        if (doDensification){
-            int numPointsBefore = means.size(0);
-            torch::Tensor avgGradNorm = (xysGradNorm / visCounts) * 0.5f * static_cast<float>( (std::max)(lastWidth, lastHeight) );
-            torch::Tensor highGrads = (avgGradNorm > densifyGradThresh).squeeze();
+    if (step > 0 && step % refineEvery == 0) return refine(step);
+    return false;
+}
 
-            // Split gaussians that are too large
-            torch::Tensor splits = (std::get<0>(scales.exp().max(-1)) > densifySizeThresh).squeeze();
-            if (step < stopScreenSizeAt){
-                splits |= (max2DSize > splitScreenSize).squeeze();
+bool Model::refine(int step){
+    bool restructured = false;
+
+    if (!boundsValid || ++refinesSinceBounds >= 5) computeBounds();
+
+    // Soft prune: mark dead splats as free slots
+    torch::Tensor active = ~freeMask;
+    torch::Tensor prune = (opacities.squeeze(-1) < -5.54126358f) // logit(1/255)
+        | (quats.pow(2).sum(-1) < 1e-8f)
+        | (std::get<0>(scales.min(-1)) < -23.0258509f); // log(1e-10)
+    if (boundsValid){
+        torch::Tensor center = torch::tensor({boundsCenter[0], boundsCenter[1], boundsCenter[2]}, means.options());
+        prune = prune | (std::get<0>(scales.max(-1)) > std::log(100.0f * boundsMaxExtent))
+                      | (std::get<0>((means - center).abs().max(-1)) > 100.0f * boundsMaxExtent);
+    }
+    prune = prune & active;
+    int prunedCount = prune.sum().item<int>();
+    if (prunedCount > 0){
+        torch::Tensor pruneIdx = torch::where(prune)[0];
+        freeMask.index_put_({pruneIdx}, true);
+        quats.index_put_({pruneIdx}, torch::zeros({prunedCount, 4}, quats.options()));
+        for (torch::optim::Adam *opt : {meansOpt, scalesOpt, quatsOpt, featuresDcOpt, featuresRestOpt, opacitiesOpt}){
+            zeroOptimizerRows(opt, pruneIdx);
+        }
+    }
+
+    // Grow and split (Long-Axis Split, Gumbel top-k selection)
+    active = ~freeMask;
+    torch::Tensor activeF = active.to(torch::kFloat32);
+    torch::Tensor visF = (visCount > 0).to(torch::kFloat32);
+    torch::Tensor candidates = (refineWeightMax > 0.003f) & (visCount > 0) & active;
+    long long activeCount = active.sum().item<long long>();
+    int budget = maxGaussians > 0 ? (std::max)(0, maxGaussians - static_cast<int>(activeCount)) : std::numeric_limits<int>::max();
+
+    torch::Tensor edgeFactor;
+    if (edgeGuidance && edgeScoreSum.defined() && edgeScoreSum.size(0) == means.size(0) && edgeSampleCount > 0){
+        torch::Tensor es = edgeScoreSum / static_cast<float>(edgeSampleCount);
+        torch::Tensor pos = es.index({es > 0});
+        if (pos.numel() > 0){
+            edgeFactor = 1.0f + 0.25f * es / pos.median().clamp_min(1e-12f);
+        }
+    }
+
+    torch::Tensor replaceW = torch::sigmoid(opacities.squeeze(-1)) * visF * activeF;
+    if (edgeFactor.defined()) replaceW = replaceW * edgeFactor;
+    int actualReplace = (std::min)((std::min)(prunedCount, budget), static_cast<int>((replaceW > 0).sum().item<long long>()));
+    torch::Tensor replaceIdx = gumbelTopK(replaceW, actualReplace);
+
+    torch::Tensor growIdx = torch::empty({0}, torch::TensorOptions().dtype(torch::kLong).device(device));
+    if (step < growUntil && budget > actualReplace){
+        int desired = static_cast<int>(std::lround(candidates.sum().item<long long>() * 0.07));
+        int nGrow = std::clamp(desired - actualReplace, 0, budget - actualReplace);
+        torch::Tensor growW = candidates.to(torch::kFloat32) * refineWeightMax;
+        if (edgeFactor.defined()) growW = growW * edgeFactor;
+        if (actualReplace > 0) growW.index_put_({replaceIdx}, 0.0f);
+        nGrow = (std::min)(nGrow, static_cast<int>((growW > 0).sum().item<long long>()));
+        growIdx = gumbelTopK(growW, nGrow);
+    }
+    torch::Tensor splitIdx = torch::cat({replaceIdx, growIdx});
+    long long K = splitIdx.size(0);
+
+    if (K > 0){
+        torch::Tensor s = scales.index({splitIdx});
+        torch::Tensor longest = s.argmax(-1);
+        torch::Tensor sLong = s.gather(1, longest.unsqueeze(1));
+        torch::Tensor offMag = torch::exp(sLong) * 0.5f;
+        torch::Tensor qs = quats.index({splitIdx});
+        torch::Tensor qn = qs / qs.norm(2, {-1}, true).clamp_min(1e-12);
+        torch::Tensor R = quatToRotMat(qn);
+        torch::Tensor dir = R.gather(2, longest.view({-1, 1, 1}).expand({K, 3, 1})).squeeze(-1);
+
+        torch::Tensor newScales = s + std::log(0.85f);
+        newScales.scatter_(1, longest.unsqueeze(1), sLong + std::log(0.5f));
+        torch::Tensor newOpac = torch::logit((torch::sigmoid(opacities.index({splitIdx})) * 0.6f).clamp(1e-6f, 1.0f - 1e-6f));
+        torch::Tensor parentMeans = means.index({splitIdx});
+        torch::Tensor childMeans = parentMeans - dir * offMag;
+        torch::Tensor childFeaturesDc = featuresDc.index({splitIdx});
+        torch::Tensor childFeaturesRest = featuresRest.index({splitIdx});
+
+        // Parent moves to +offset, gets the shrunk shape
+        means.index_put_({splitIdx}, parentMeans + dir * offMag);
+        scales.index_put_({splitIdx}, newScales);
+        opacities.index_put_({splitIdx}, newOpac);
+
+        // Stale-gradient safety: zero this iteration's grads at parent rows
+        for (torch::Tensor *p : {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities}){
+            if (p->mutable_grad().defined()){
+                p->mutable_grad().index_put_({splitIdx}, torch::zeros_like(p->mutable_grad().index({splitIdx})));
             }
-
-            splits &= highGrads;
-            const int nSplitSamples = 2;
-            int nSplits = splits.sum().item<int>();
-
-            torch::Tensor centeredSamples = torch::randn({nSplitSamples * nSplits, 3}, device);  // Nx3 of axis-aligned scales
-            torch::Tensor scaledSamples = torch::exp(scales.index({splits}).repeat({nSplitSamples, 1})) * centeredSamples;
-            torch::Tensor qs = quats.index({splits}) / torch::linalg_vector_norm(quats.index({splits}), 2, { -1 }, true, torch::kFloat32);
-            torch::Tensor rots = quatToRotMat(qs.repeat({nSplitSamples, 1}));
-            torch::Tensor rotatedSamples = torch::bmm(rots, scaledSamples.index({"...", None})).squeeze();
-            torch::Tensor splitMeans = rotatedSamples + means.index({splits}).repeat({nSplitSamples, 1});
-            
-            torch::Tensor splitFeaturesDc = featuresDc.index({splits}).repeat({nSplitSamples, 1});
-            torch::Tensor splitFeaturesRest = featuresRest.index({splits}).repeat({nSplitSamples, 1, 1});
-            
-            torch::Tensor splitOpacities = opacities.index({splits}).repeat({nSplitSamples, 1});
-        
-            const float sizeFac = 1.6f;
-            torch::Tensor splitScales = torch::log(torch::exp(scales.index({splits})) / sizeFac).repeat({nSplitSamples, 1});
-            scales.index({splits}) = torch::log(torch::exp(scales.index({splits})) / sizeFac);
-            torch::Tensor splitQuats = quats.index({splits}).repeat({nSplitSamples, 1});
-
-            // Duplicate gaussians that are too small
-            torch::Tensor dups = (std::get<0>(scales.exp().max(-1)) <= densifySizeThresh).squeeze();
-            dups &= highGrads;
-            torch::Tensor dupMeans = means.index({dups});
-            torch::Tensor dupFeaturesDc = featuresDc.index({dups});
-            torch::Tensor dupFeaturesRest = featuresRest.index({dups});
-            torch::Tensor dupOpacities = opacities.index({dups});
-            torch::Tensor dupScales = scales.index({dups});
-            torch::Tensor dupQuats = quats.index({dups});
-
-            means = torch::cat({means.detach(), splitMeans, dupMeans}, 0).requires_grad_();
-            featuresDc = torch::cat({featuresDc.detach(), splitFeaturesDc, dupFeaturesDc}, 0).requires_grad_();
-            featuresRest = torch::cat({featuresRest.detach(), splitFeaturesRest, dupFeaturesRest}, 0).requires_grad_();
-            opacities = torch::cat({opacities.detach(), splitOpacities, dupOpacities}, 0).requires_grad_();
-            scales = torch::cat({scales.detach(), splitScales, dupScales}, 0).requires_grad_();
-            quats = torch::cat({quats.detach(), splitQuats, dupQuats}, 0).requires_grad_();
-            
-            max2DSize = torch::cat({
-                max2DSize,
-                torch::zeros_like(splitScales.index({Slice(), 0})),
-                torch::zeros_like(dupScales.index({Slice(), 0}))
-            }, 0);
-
-            torch::Tensor splitIdcs = torch::where(splits)[0];
-
-            addToOptimizer(meansOpt, means, splitIdcs, nSplitSamples);
-            addToOptimizer(scalesOpt, scales, splitIdcs, nSplitSamples);
-            addToOptimizer(quatsOpt, quats, splitIdcs, nSplitSamples);
-            addToOptimizer(featuresDcOpt, featuresDc, splitIdcs, nSplitSamples);
-            addToOptimizer(featuresRestOpt, featuresRest, splitIdcs, nSplitSamples);
-            addToOptimizer(opacitiesOpt, opacities, splitIdcs, nSplitSamples);
-            
-            torch::Tensor dupIdcs = torch::where(dups)[0];
-            addToOptimizer(meansOpt, means, dupIdcs, 1);
-            addToOptimizer(scalesOpt, scales, dupIdcs, 1);
-            addToOptimizer(quatsOpt, quats, dupIdcs, 1);
-            addToOptimizer(featuresDcOpt, featuresDc, dupIdcs, 1);
-            addToOptimizer(featuresRestOpt, featuresRest, dupIdcs, 1);
-            addToOptimizer(opacitiesOpt, opacities, dupIdcs, 1);
-
-            splitsMask = torch::cat({
-                splits,
-                torch::full({nSplitSamples * splits.sum().item<int>() + dups.sum().item<int>()}, false, torch::TensorOptions().dtype(torch::kBool).device(device))
-            }, 0);
-
-            std::cout << "Added " << (means.size(0) - numPointsBefore) << " gaussians, new count " << means.size(0) << std::endl;
         }
 
-        if (doDensification){
-            // Cull
-            int numPointsBefore = means.size(0);
-
-            torch::Tensor culls = (torch::sigmoid(opacities) < cullAlphaThresh).squeeze();
-            if (splitsMask.numel()){
-                culls |= splitsMask;
+        // Children fill free slots first, then append
+        torch::Tensor freeIdx = torch::where(freeMask)[0];
+        long long nFill = (std::min)(K, freeIdx.size(0));
+        if (nFill > 0){
+            torch::Tensor fillIdx = freeIdx.slice(0, 0, nFill);
+            means.index_put_({fillIdx}, childMeans.slice(0, 0, nFill));
+            scales.index_put_({fillIdx}, newScales.slice(0, 0, nFill));
+            quats.index_put_({fillIdx}, qn.slice(0, 0, nFill));
+            featuresDc.index_put_({fillIdx}, childFeaturesDc.slice(0, 0, nFill));
+            featuresRest.index_put_({fillIdx}, childFeaturesRest.slice(0, 0, nFill));
+            opacities.index_put_({fillIdx}, newOpac.slice(0, 0, nFill));
+            freeMask.index_put_({fillIdx}, false);
+            for (torch::optim::Adam *opt : {meansOpt, scalesOpt, quatsOpt, featuresDcOpt, featuresRestOpt, opacitiesOpt}){
+                zeroOptimizerRows(opt, fillIdx);
             }
-
-            if (step > refineEvery * resetAlphaEvery){
-                const float cullScaleThresh = 0.5f; // cull huge gaussians
-                const float cullScreenSize = 0.15f; // % of screen space
-                torch::Tensor huge = std::get<0>(torch::exp(scales).max(-1)) > cullScaleThresh;
-                if (step < stopScreenSizeAt){
-                    huge |= max2DSize > cullScreenSize;
+            for (torch::Tensor *p : {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities}){
+                if (p->mutable_grad().defined()){
+                    p->mutable_grad().index_put_({fillIdx}, torch::zeros_like(p->mutable_grad().index({fillIdx})));
                 }
-                culls |= huge;
-            }
-
-            int cullCount = torch::sum(culls).item<int>();
-            if (cullCount > 0){
-                means = means.index({~culls}).detach().requires_grad_();
-                scales = scales.index({~culls}).detach().requires_grad_();
-                quats = quats.index({~culls}).detach().requires_grad_();
-                featuresDc = featuresDc.index({~culls}).detach().requires_grad_();
-                featuresRest = featuresRest.index({~culls}).detach().requires_grad_();
-                opacities = opacities.index({~culls}).detach().requires_grad_();
-
-                removeFromOptimizer(meansOpt, means, culls);
-                removeFromOptimizer(scalesOpt, scales, culls);
-                removeFromOptimizer(quatsOpt, quats, culls);
-                removeFromOptimizer(featuresDcOpt, featuresDc, culls);
-                removeFromOptimizer(featuresRestOpt, featuresRest, culls);
-                removeFromOptimizer(opacitiesOpt, opacities, culls);
-                
-                std::cout << "Culled " << (numPointsBefore - means.size(0)) << " gaussians, remaining " << means.size(0) << std::endl;
             }
         }
+        long long nAppend = K - nFill;
+        if (nAppend > 0){
+            torch::Tensor tailIdx = splitIdx.slice(0, nFill, K);
+            means = torch::cat({means.detach(), childMeans.slice(0, nFill, K)}, 0).requires_grad_();
+            scales = torch::cat({scales.detach(), newScales.slice(0, nFill, K)}, 0).requires_grad_();
+            quats = torch::cat({quats.detach(), qn.slice(0, nFill, K)}, 0).requires_grad_();
+            featuresDc = torch::cat({featuresDc.detach(), childFeaturesDc.slice(0, nFill, K)}, 0).requires_grad_();
+            featuresRest = torch::cat({featuresRest.detach(), childFeaturesRest.slice(0, nFill, K)}, 0).requires_grad_();
+            opacities = torch::cat({opacities.detach(), newOpac.slice(0, nFill, K)}, 0).requires_grad_();
 
-        if (step < stopSplitAt && step % resetInterval == refineEvery){
-            float resetValue = cullAlphaThresh * 2.0f;
-            opacities = torch::clamp_max(opacities, torch::logit(torch::tensor(resetValue)).item<float>());
+            addToOptimizer(meansOpt, means, tailIdx, 1);
+            addToOptimizer(scalesOpt, scales, tailIdx, 1);
+            addToOptimizer(quatsOpt, quats, tailIdx, 1);
+            addToOptimizer(featuresDcOpt, featuresDc, tailIdx, 1);
+            addToOptimizer(featuresRestOpt, featuresRest, tailIdx, 1);
+            addToOptimizer(opacitiesOpt, opacities, tailIdx, 1);
 
-            // Reset optimizer
-            torch::Tensor param = opacitiesOpt->param_groups()[0].params()[0];
-            #if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR > 1
-                auto pId = param.unsafeGetTensorImpl();
-            #else
-                auto pId = c10::guts::to_string(param.unsafeGetTensorImpl());
-            #endif    
-            auto paramState = std::make_unique<torch::optim::AdamParamState>(static_cast<torch::optim::AdamParamState&>(*opacitiesOpt->state()[pId]));
-            paramState->exp_avg(torch::zeros_like(paramState->exp_avg()));
-            paramState->exp_avg_sq(torch::zeros_like(paramState->exp_avg_sq()));
-            std::cout << "Alpha reset" << std::endl;
+            freeMask = torch::cat({freeMask, torch::zeros({nAppend}, freeMask.options())}, 0);
+            restructured = true;
         }
-
-        // Clear
-        xysGradNorm = torch::Tensor();
-        visCounts = torch::Tensor();
-        max2DSize = torch::Tensor();
-
-        if (device != torch::kCPU){
-            #ifdef USE_HIP
-                    c10::hip::HIPCachingAllocator::emptyCache();
-            #elif defined(USE_CUDA)
-                    c10::cuda::CUDACachingAllocator::emptyCache();
-            #endif
-        }
+        std::cout << "Refine " << step << ": pruned " << prunedCount << ", split " << K
+                  << " (" << actualReplace << " into free slots budget), total " << means.size(0)
+                  << " (" << (~freeMask).sum().item<long long>() << " active)" << std::endl;
     }
+
+    // Enforce max gaussians (keep by opacity, Gumbel top-k)
+    active = ~freeMask;
+    activeCount = active.sum().item<long long>();
+    if (maxGaussians > 0 && activeCount > maxGaussians){
+        torch::Tensor keepW = torch::sigmoid(opacities.squeeze(-1)) * active.to(torch::kFloat32);
+        torch::Tensor keepIdx = gumbelTopK(keepW, maxGaussians);
+        torch::Tensor keepMask = torch::zeros({means.size(0)}, torch::TensorOptions().dtype(torch::kBool).device(device));
+        keepMask.index_put_({keepIdx}, true);
+        torch::Tensor cullMask = ~keepMask;
+
+        means = means.index({keepMask}).detach().requires_grad_();
+        scales = scales.index({keepMask}).detach().requires_grad_();
+        quats = quats.index({keepMask}).detach().requires_grad_();
+        featuresDc = featuresDc.index({keepMask}).detach().requires_grad_();
+        featuresRest = featuresRest.index({keepMask}).detach().requires_grad_();
+        opacities = opacities.index({keepMask}).detach().requires_grad_();
+
+        removeFromOptimizer(meansOpt, means, cullMask);
+        removeFromOptimizer(scalesOpt, scales, cullMask);
+        removeFromOptimizer(quatsOpt, quats, cullMask);
+        removeFromOptimizer(featuresDcOpt, featuresDc, cullMask);
+        removeFromOptimizer(featuresRestOpt, featuresRest, cullMask);
+        removeFromOptimizer(opacitiesOpt, opacities, cullMask);
+
+        freeMask = torch::zeros({means.size(0)}, torch::TensorOptions().dtype(torch::kBool).device(device));
+        restructured = true;
+        std::cout << "Max cap enforced, kept " << means.size(0) << " gaussians" << std::endl;
+    }
+
+    // Decay instead of opacity reset
+    float tShrink = 1.0f - static_cast<float>(step) / maxSteps;
+    torch::Tensor op = (torch::sigmoid(opacities) - 0.004f * tShrink).clamp(1e-6f, 1.0f - 1e-6f);
+    opacities.copy_(torch::logit(op));
+    scales.copy_(torch::log((scales.exp() * (1.0f - 0.002f * tShrink)).clamp_min(1e-12f)));
+
+    // Reset per-window stats
+    visCount = torch::Tensor();
+    refineWeightMax = torch::Tensor();
+    edgeScoreSum = torch::Tensor();
+    edgeSampleCount = 0;
+
+    if (device != torch::kCPU){
+        #ifdef USE_HIP
+                c10::hip::HIPCachingAllocator::emptyCache();
+        #elif defined(USE_CUDA)
+                c10::cuda::CUDACachingAllocator::emptyCache();
+        #endif
+    }
+    return restructured;
 }
 
 void Model::save(const std::string &filename, int step){
@@ -865,8 +1028,32 @@ int Model::loadPly(const std::string &filename){
     throw std::runtime_error("Invalid PLY file");
 }
 
-torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, float ssimWeight){
-    torch::Tensor ssimLoss = 1.0f - ssim.eval(rgb, gt);
-    torch::Tensor l1Loss = l1(rgb, gt);
-    return (1.0f - ssimWeight) * l1Loss + ssimWeight * ssimLoss;
+torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, torch::Tensor &mask, float ssimWeight){
+    bool hasMask = mask.defined() && mask.numel() > 0;
+    torch::Tensor w = hasMask ? mask : torch::ones({gt.size(0), gt.size(1)}, gt.options());
+
+    torch::Tensor l1Loss = (w.unsqueeze(-1) * torch::abs(gt - rgb)).sum() / (w.sum() * gt.size(2) + 1e-8f);
+
+    torch::Tensor ssimMap = ssim.map(rgb, gt);
+    int pad = ssim.getWindowSize() / 2;
+    torch::Tensor wv = w.index({Slice(pad, w.size(0) - pad), Slice(pad, w.size(1) - pad)});
+    torch::Tensor sv = ssimMap.index({Slice(pad, ssimMap.size(0) - pad), Slice(pad, ssimMap.size(1) - pad)});
+    torch::Tensor dssim = (wv * (1.0f - sv)).sum() / (wv.sum() + 1e-8f);
+
+    torch::Tensor loss = (1.0f - ssimWeight) * l1Loss + ssimWeight * dssim;
+
+    // Segment-mode opacity penalty: push alpha to 0 in masked-out areas
+    if (hasMask && lastAlpha.defined() && lastAlpha.numel() == w.numel()){
+        loss = loss + (lastAlpha * (1.0f - w).pow(2.0f)).mean();
+    }
+
+    // Densification error map (per-pixel DSSIM, mean-normalized)
+    if (errorMap.defined() && errorMap.numel() == ssimMap.numel()){
+        torch::NoGradGuard noGrad;
+        torch::Tensor err = 1.0f - ssimMap.detach();
+        if (hasMask) err = err * w;
+        errorMap.copy_(err / (err.mean() + 1e-6f));
+    }
+
+    return loss;
 }

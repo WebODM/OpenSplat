@@ -179,5 +179,8 @@ std::
         const torch::Tensor &final_Ts,
         const torch::Tensor &final_idx,
         const torch::Tensor &v_output, // dL_dout_color
-        const torch::Tensor &v_output_alpha
+        const torch::Tensor &v_output_alpha,
+        const torch::Tensor &error_map, // [H,W] or empty
+        const torch::Tensor &edge_map, // [H,W] or empty
+        const torch::Tensor &densification_info // [3,N] accumulated in place, or empty
     );

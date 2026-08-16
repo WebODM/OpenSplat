@@ -1,4 +1,4 @@
-#include <metal_stdlib>
+﻿#include <metal_stdlib>
 
 using namespace metal;
 
@@ -857,6 +857,12 @@ kernel void rasterize_backward_kernel(
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
     device atomic_float* v_opacity,
+    constant int& num_points,
+    constant int& has_densification,
+    constant int& has_edge,
+    constant float* error_map,
+    constant float* edge_map,
+    device atomic_float* densification_info, // [3, num_points]
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -898,6 +904,8 @@ kernel void rasterize_backward_kernel(
     // df/d_out for this pixel
     const float3 v_out = read_packed_float3(v_output, pix_id);
     const float v_out_alpha = v_output_alpha[pix_id];
+    const float pix_err = (has_densification != 0 && inside) ? error_map[pix_id] : 1.0f;
+    const float pix_edge = (has_densification != 0 && has_edge != 0 && inside) ? edge_map[pix_id] : 0.0f;
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing
@@ -946,7 +954,7 @@ kernel void rasterize_backward_kernel(
                                             conic.z * delta.y * delta.y) +
                                     conic.y * delta.x * delta.y;
                 vis = exp(-sigma);
-                alpha = min(0.99f, opac * vis);
+                alpha = min(0.999f, opac * vis);
                 if (sigma < 0.f || alpha < 1.f / 255.f) {
                     valid = 0;
                 }
@@ -960,13 +968,21 @@ kernel void rasterize_backward_kernel(
             float3 v_conic_local = {0.f, 0.f, 0.f};
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
+            float dens_w_local = 0.f;
+            float dens_e_local = 0.f;
+            float dens_g_local = 0.f;
             //initialize everything to 0, only set if the lane is valid
-            if(valid && alpha<0.99f){
+            if(valid){
                 // compute the current T for this gaussian
                 float ra = 1.f / (1.f - alpha);
                 T *= ra;
-                // update v_rgb for this gaussian
                 const float fac = alpha * T;
+                if (has_densification != 0){
+                    dens_w_local = fac;
+                    dens_e_local = fac * pix_err;
+                    dens_g_local = fac * pix_edge;
+                }
+                // update v_rgb for this gaussian
                 float v_alpha = 0.f;
                 v_rgb_local = {fac * v_out.x, fac * v_out.y, fac * v_out.z};
 
@@ -987,10 +1003,10 @@ kernel void rasterize_backward_kernel(
                 buffer.z += rgb.z * fac;
 
                 const float v_sigma = -opac * vis * v_alpha;
-                v_conic_local = {0.5f * v_sigma * delta.x * delta.x, 
-                                        0.5f * v_sigma * delta.x * delta.y, 
+                v_conic_local = {0.5f * v_sigma * delta.x * delta.x,
+                                        0.5f * v_sigma * delta.x * delta.y,
                                         0.5f * v_sigma * delta.y * delta.y};
-                v_xy_local = {v_sigma * (conic.x * delta.x + conic.y * delta.y), 
+                v_xy_local = {v_sigma * (conic.x * delta.x + conic.y * delta.y),
                                     v_sigma * (conic.y * delta.x + conic.z * delta.y)};
                 v_opacity_local = vis * v_alpha;
             }
@@ -999,6 +1015,11 @@ kernel void rasterize_backward_kernel(
             v_conic_local = warpSum3(v_conic_local, warp_size, wr);
             v_xy_local = warpSum2(v_xy_local, warp_size, wr);
             v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
+            if (has_densification != 0){
+                dens_w_local = warpSum(dens_w_local, warp_size, wr);
+                dens_e_local = warpSum(dens_e_local, warp_size, wr);
+                dens_g_local = warpSum(dens_g_local, warp_size, wr);
+            }
 
             if (wr == 0) {
                 int32_t g = id_batch[t];
@@ -1006,15 +1027,21 @@ kernel void rasterize_backward_kernel(
                 atomic_fetch_add_explicit(v_rgb + 3*g + 0, v_rgb_local.x, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_rgb + 3*g + 1, v_rgb_local.y, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_rgb + 3*g + 2, v_rgb_local.z, memory_order_relaxed);
-                
+
                 atomic_fetch_add_explicit(v_conic + 3*g + 0, v_conic_local.x, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_conic + 3*g + 1, v_conic_local.y, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_conic + 3*g + 2, v_conic_local.z, memory_order_relaxed);
-                
+
                 atomic_fetch_add_explicit(v_xy + 2*g + 0, v_xy_local.x, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_xy + 2*g + 1, v_xy_local.y, memory_order_relaxed);
-                
+
                 atomic_fetch_add_explicit(v_opacity + g, v_opacity_local, memory_order_relaxed);
+
+                if (has_densification != 0){
+                    atomic_fetch_add_explicit(densification_info + g, dens_w_local, memory_order_relaxed);
+                    atomic_fetch_add_explicit(densification_info + num_points + g, dens_e_local, memory_order_relaxed);
+                    atomic_fetch_add_explicit(densification_info + 2 * num_points + g, dens_g_local, memory_order_relaxed);
+                }
             }
         }
     }
@@ -1090,7 +1117,7 @@ kernel void nd_rasterize_backward_kernel(
         }
         const float opac = opacities[g];
         const float vis = exp(-sigma);
-        const float alpha = min(0.99f, opac * vis);
+        const float alpha = min(0.999f, opac * vis);
         if (alpha < 1.f / 255.f) {
             continue;
         }

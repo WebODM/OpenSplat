@@ -13,6 +13,8 @@ public:
     };
 
     torch::Tensor eval(const torch::Tensor& rendered, const torch::Tensor& gt);
+    torch::Tensor map(const torch::Tensor& rendered, const torch::Tensor& gt);
+    int getWindowSize() const { return windowSize; }
 private:
     torch::Tensor createWindow();
     torch::Tensor gaussian(float sigma);

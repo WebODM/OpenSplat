@@ -69,7 +69,10 @@ std::
         const torch::Tensor &final_Ts,
         const std::vector<int32_t> *px2gid,
         const torch::Tensor &v_output, // dL_dout_color
-        const torch::Tensor &v_output_alpha
+        const torch::Tensor &v_output_alpha,
+        const torch::Tensor &error_map,
+        const torch::Tensor &edge_map,
+        const torch::Tensor &densification_info
     );
 
 int numShBases(int degree);

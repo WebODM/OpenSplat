@@ -1,4 +1,4 @@
-// Originally started from https://github.com/nerfstudio-project/gsplat
+﻿// Originally started from https://github.com/nerfstudio-project/gsplat
 // This implementation has been substantially changed and optimized 
 // Licensed under the AGPLv3
 // Piero Toffanin - 2024
@@ -277,7 +277,10 @@ std::
         const torch::Tensor &final_Ts,
         const std::vector<int32_t> *px2gid,
         const torch::Tensor &v_output, // dL_dout_color
-        const torch::Tensor &v_output_alpha
+        const torch::Tensor &v_output_alpha,
+        const torch::Tensor &error_map,
+        const torch::Tensor &edge_map,
+        const torch::Tensor &densification_info
     ){
     torch::NoGradGuard noGrad;
 
@@ -307,6 +310,9 @@ std::
     float bgZ = background[2].item<float>();
 
     float *pFinalTs = static_cast<float *>(final_Ts.data_ptr());
+    float *pDinfo = densification_info.numel() > 0 ? static_cast<float *>(densification_info.data_ptr()) : nullptr;
+    float *pErr = error_map.numel() > 0 ? static_cast<float *>(error_map.data_ptr()) : nullptr;
+    float *pEdge = edge_map.numel() > 0 ? static_cast<float *>(edge_map.data_ptr()) : nullptr;
 
     const float alphaThresh = 1.0f / 255.0f;
 
@@ -335,12 +341,19 @@ std::
 
                 if (sigma < 0.0f) continue;
                 float vis = std::exp(-sigma);
-                float alpha = (std::min)(0.99f, pOpacities[gaussianId] * vis);
+                float alpha = (std::min)(0.999f, pOpacities[gaussianId] * vis);
                 if (alpha < alphaThresh) continue;
 
                 float ra = 1.0f / (1.0f - alpha);
                 T *= ra;
                 float fac = alpha * T;
+
+                if (pDinfo){
+                    float err = pErr ? pErr[pixIdx] : 1.0f;
+                    pDinfo[gaussianId] += fac;
+                    pDinfo[numPoints + gaussianId] += fac * err;
+                    if (pEdge) pDinfo[2 * numPoints + gaussianId] += fac * pEdge[pixIdx];
+                }
 
                 pv_colors[gaussianId * 3 + 0] += fac * pv_output[pixIdx * 3 + 0];
                 pv_colors[gaussianId * 3 + 1] += fac * pv_output[pixIdx * 3 + 1];
