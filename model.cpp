@@ -257,6 +257,9 @@ torch::Tensor Model::forward(Camera& cam, int step){
         // Abs-GS screen-gradient accumulation while densification is active
         xyAbsGrad = step <= densifyUntilIter ? torch::zeros({means.size(0), 2}, fOpts)
                                              : torch::empty({0}, fOpts);
+    }else if (edgeGuidance){
+        // Scoring pass: edge-weighted blending accumulates in densification_info row 2
+        camEdgeMap = cam.getEdgeMapGpu(getDownscaleFactor(step), device);
     }
     // During scoring passes, errorMap/densificationInfo are managed by computeMultiViewScores
 
@@ -448,6 +451,7 @@ std::tuple<torch::Tensor, torch::Tensor> Model::computeMultiViewScores(int step,
     auto fOpts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
     torch::Tensor fullCounts = torch::zeros({N}, fOpts);
     torch::Tensor fullScore = torch::zeros({N}, fOpts);
+    torch::Tensor edgeScores = torch::zeros({N}, fOpts);
 
     std::vector<size_t> indices(trainCams->size());
     std::iota(indices.begin(), indices.end(), 0);
@@ -488,6 +492,7 @@ std::tuple<torch::Tensor, torch::Tensor> Model::computeMultiViewScores(int step,
         torch::Tensor counts = densificationInfo[3];
         fullCounts += counts;
         fullScore += photometric * counts;
+        if (edgeGuidance) edgeScores += densificationInfo[2];
     }
     scoringPass = false;
     errorMap = torch::empty({0}, fOpts);
@@ -497,6 +502,14 @@ std::tuple<torch::Tensor, torch::Tensor> Model::computeMultiViewScores(int step,
     torch::Tensor importance;
     if (densify){
         importance = (fullCounts / static_cast<float>(numViews)).floor();
+        if (edgeGuidance){
+            // Bias densification toward image edges (combats blur):
+            // factor = 1 + 0.25 * median-normalized edge score
+            torch::Tensor pos = edgeScores.index({edgeScores > 0});
+            if (pos.numel() > 0){
+                importance = importance * (1.0f + 0.25f * edgeScores / pos.median().clamp_min(1e-12f));
+            }
+        }
     }
     float lo = fullScore.min().item<float>();
     float hi = fullScore.max().item<float>();

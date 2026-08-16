@@ -159,6 +159,7 @@ struct Model{
   int opacityResetInterval = 3000;
   int numScoreViews = 10;
   float opacityReg = 0.01f; // global haze/floater penalty on mean opacity
+  bool edgeGuidance = true; // Canny-edge weighting of the densification importance
 
   float scale;
   torch::Tensor translation;

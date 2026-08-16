@@ -225,6 +225,10 @@ torch::Tensor Camera::getMaskGpu(int downscaleFactor, const torch::Device &devic
     return gpuCached(gpuMaskCache, downscaleFactor, m, device);
 }
 
+torch::Tensor Camera::getEdgeMapGpu(int downscaleFactor, const torch::Device &device){
+    return gpuCached(gpuEdgeCache, downscaleFactor, getEdgeMap(downscaleFactor).contiguous(), device);
+}
+
 torch::Tensor Camera::getEdgeMap(int downscaleFactor){
     if (edgePyramids.find(downscaleFactor) != edgePyramids.end()){
         return edgePyramids[downscaleFactor];
