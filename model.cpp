@@ -512,6 +512,22 @@ void Model::resetOpacity(float value){
     zeroOptimizerRows(opacitiesOpt, allIdx);
 }
 
+// Escaped or exploded splats relative to a percentile scene AABB
+// (robust to the floaters it is meant to catch)
+static torch::Tensor spatialSanityMask(const torch::Tensor &means, const torch::Tensor &scales, const torch::Device &device){
+    torch::NoGradGuard noGrad;
+    torch::Tensor mc = means.detach().cpu();
+    long long n = mc.size(0);
+    if (n < 8) return torch::zeros({n}, torch::TensorOptions().dtype(torch::kBool).device(device));
+    torch::Tensor lo = std::get<0>(mc.kthvalue((std::max)(static_cast<long long>(1), static_cast<long long>(0.1 * n)), 0));
+    torch::Tensor hi = std::get<0>(mc.kthvalue((std::min)(n, static_cast<long long>(0.9 * n) + 1), 0));
+    torch::Tensor center = ((lo + hi) / 2.0f).to(device);
+    float maxExtent = (std::max)(((hi - lo) / 2.0f).max().item<float>(), 1e-6f);
+    torch::Tensor escaped = std::get<0>((means.detach() - center).abs().max(-1)) > 100.0f * maxExtent;
+    torch::Tensor exploded = std::get<0>(scales.detach().exp().max(-1)) > 100.0f * maxExtent;
+    return escaped | exploded;
+}
+
 void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, const torch::Tensor &pruningScore){
     torch::NoGradGuard noGrad;
     long long numPointsBefore = means.size(0);
@@ -591,9 +607,10 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
     long long N = means.size(0);
     auto boolOpts = torch::TensorOptions().dtype(torch::kBool).device(device);
 
-    // Split parents must go
+    // Split parents must go; escaped/exploded splats are pruned unconditionally
     torch::Tensor parentMask = torch::zeros({N}, boolOpts);
     if (nSplits > 0) parentMask.index_put_({splitIdx}, true);
+    torch::Tensor sanityMask = spatialSanityMask(means, scales, device);
 
     // Targeted pruning: opacity/size candidates, remove only half of them,
     // sampled by inverse (1 - pruning_score)
@@ -606,7 +623,7 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
     pruneMask &= ~parentMask; // parents handled separately
 
     long long removeBudget = pruneMask.sum().item<long long>() / 2;
-    torch::Tensor finalPrune = parentMask.clone();
+    torch::Tensor finalPrune = parentMask | sanityMask;
     if (removeBudget > 0){
         torch::Tensor weights = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
         long long S = (std::min)(pruningScore.size(0), N);
@@ -692,7 +709,8 @@ bool Model::afterTrain(int step){
         auto scores = computeMultiViewScores(step, false);
         torch::NoGradGuard noGrad;
         torch::Tensor pruningScore = std::get<1>(scores);
-        torch::Tensor pruneMask = (torch::sigmoid(opacities.squeeze(-1)) < 0.1f) | (pruningScore > 0.9f);
+        torch::Tensor pruneMask = (torch::sigmoid(opacities.squeeze(-1)) < 0.1f) | (pruningScore > 0.9f)
+                                | spatialSanityMask(means, scales, device);
         long long cullCount = pruneMask.sum().item<long long>();
         if (cullCount > 0 && cullCount < means.size(0)){
             torch::Tensor keep = ~pruneMask;
@@ -1106,6 +1124,11 @@ torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, torch::Tens
     // Segment-mode opacity penalty: push alpha to 0 in masked-out areas
     if (hasMask && lastAlpha.defined() && lastAlpha.numel() == w.numel()){
         loss = loss + (lastAlpha * (1.0f - w).pow(2.0f)).mean();
+    }
+
+    // Global opacity regularization: taxes haze and unsupported floaters
+    if (opacityReg > 0.0f){
+        loss = loss + opacityReg * torch::sigmoid(opacities).mean();
     }
 
     return loss;

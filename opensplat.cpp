@@ -39,19 +39,11 @@ int main(int argc, char *argv[]){
         ("densify-from", "Start densifying gaussians after these many steps", cxxopts::value<int>()->default_value("500"))
         ("densify-until", "Stop densifying gaussians after these many steps (-1 = min(15000, half of num-iters))", cxxopts::value<int>()->default_value("-1"))
         ("loss-thresh", "High-error pixel threshold on the normalized L1 map for multi-view scoring", cxxopts::value<float>()->default_value("0.1"))
+        ("opacity-reg", "Opacity regularization weight (penalizes haze/floaters, 0 to disable)", cxxopts::value<float>()->default_value("0.01"))
         ("max-gaussians", "Maximum number of gaussians (0 = unlimited)", cxxopts::value<int>()->default_value("5000000"))
         ("invert-masks", "Invert image masks (swap object/background)", cxxopts::value<bool>()->default_value("false"))
         ("no-masks", "Ignore image masks even when present", cxxopts::value<bool>()->default_value("false"))
         ("no-gpu-cache", "Do not cache images/masks on the GPU (reduces VRAM usage, slower)", cxxopts::value<bool>()->default_value("false"))
-        ("stop-refine", "(deprecated, ignored)", cxxopts::value<int>()->default_value("-1"))
-        ("grow-until", "(deprecated, ignored)", cxxopts::value<int>()->default_value("-1"))
-        ("no-edge-guidance", "(deprecated, ignored)", cxxopts::value<bool>()->default_value("false"))
-        ("warmup-length", "(deprecated, ignored)", cxxopts::value<int>()->default_value("500"))
-        ("reset-alpha-every", "(deprecated, ignored)", cxxopts::value<int>()->default_value("30"))
-        ("densify-grad-thresh", "(deprecated, ignored)", cxxopts::value<float>()->default_value("0.0002"))
-        ("densify-size-thresh", "(deprecated, ignored)", cxxopts::value<float>()->default_value("0.01"))
-        ("stop-screen-size-at", "(deprecated, ignored)", cxxopts::value<int>()->default_value("4000"))
-        ("split-screen-size", "(deprecated, ignored)", cxxopts::value<float>()->default_value("0.05"))
 #ifdef USE_VISUALIZATION
         ("has-visualization", "Show the visualization steps of training", cxxopts::value<bool>()->default_value("0"))
 #endif
@@ -160,6 +152,7 @@ int main(int argc, char *argv[]){
                     numIters, keepCrs,
                     device);
         model.trainCams = &cams;
+        model.opacityReg = result["opacity-reg"].as<float>();
         Camera::gpuCacheEnabled = !result["no-gpu-cache"].as<bool>();
 
         std::vector< size_t > camIndices( cams.size() );

@@ -158,6 +158,7 @@ struct Model{
   float gradAbsThresh = 0.0012f;
   int opacityResetInterval = 3000;
   int numScoreViews = 10;
+  float opacityReg = 0.01f; // global haze/floater penalty on mean opacity
 
   float scale;
   torch::Tensor translation;
