@@ -12,6 +12,7 @@ struct MetalContext {
 
     id<MTLComputePipelineState> nd_rasterize_backward_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
+    id<MTLComputePipelineState> rasterize_forward_kernel_cpso;
     id<MTLComputePipelineState> rasterize_backward_kernel_cpso;
     id<MTLComputePipelineState> project_gaussians_forward_kernel_cpso;
     id<MTLComputePipelineState> project_gaussians_backward_kernel_cpso;
@@ -20,6 +21,10 @@ struct MetalContext {
     id<MTLComputePipelineState> compute_cov2d_bounds_kernel_cpso;
     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
     id<MTLComputePipelineState> get_tile_bin_edges_kernel_cpso;
+    id<MTLComputePipelineState> fused_ssim_stack_kernel_cpso;
+    id<MTLComputePipelineState> fused_ssim_pointwise_fwd_kernel_cpso;
+    id<MTLComputePipelineState> fused_ssim_pointwise_bwd_pre_kernel_cpso;
+    id<MTLComputePipelineState> fused_ssim_pointwise_bwd_post_kernel_cpso;
 };
 
 unsigned num_sh_bases(const unsigned degree) {
@@ -109,6 +114,7 @@ MetalContext* init_gsplat_metal_context() {
 
     GSPLAT_METAL_ADD_KERNEL(nd_rasterize_backward_kernel);
     GSPLAT_METAL_ADD_KERNEL(nd_rasterize_forward_kernel);
+    GSPLAT_METAL_ADD_KERNEL(rasterize_forward_kernel);
     GSPLAT_METAL_ADD_KERNEL(rasterize_backward_kernel);
     GSPLAT_METAL_ADD_KERNEL(project_gaussians_forward_kernel);
     GSPLAT_METAL_ADD_KERNEL(project_gaussians_backward_kernel);
@@ -117,6 +123,10 @@ MetalContext* init_gsplat_metal_context() {
     GSPLAT_METAL_ADD_KERNEL(compute_cov2d_bounds_kernel);
     GSPLAT_METAL_ADD_KERNEL(map_gaussian_to_intersects_kernel);
     GSPLAT_METAL_ADD_KERNEL(get_tile_bin_edges_kernel);
+    GSPLAT_METAL_ADD_KERNEL(fused_ssim_stack_kernel);
+    GSPLAT_METAL_ADD_KERNEL(fused_ssim_pointwise_fwd_kernel);
+    GSPLAT_METAL_ADD_KERNEL(fused_ssim_pointwise_bwd_pre_kernel);
+    GSPLAT_METAL_ADD_KERNEL(fused_ssim_pointwise_bwd_post_kernel);
 
     [metal_library release];
 
@@ -182,16 +192,20 @@ private:
     size_t _arrayNumBytes;
     const torch::Tensor* _tensor;
 
-    friend void dispatchKernel(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSize grid_size, MTLSize thread_group_size, std::vector<EncodeArg> args);
+    friend void dispatchKernelEx(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSize grid_size, MTLSize thread_group_size, bool by_threadgroups, std::vector<EncodeArg> args);
 };
 
-void dispatchKernel(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSize grid_size, MTLSize thread_group_size, std::vector<EncodeArg> args) {
-    // Get a reference to the command buffer for the MPS stream
-    id<MTLCommandBuffer> command_buffer = torch::mps::get_command_buffer();
-    TORCH_CHECK(command_buffer, "Failed to retrieve command buffer reference");
-
+// grid_size is a thread count when by_threadgroups is false (partial edge
+// threadgroups), or a threadgroup count when it is true. Kernels that stage
+// data in threadgroup memory must use the latter: a partial threadgroup would
+// leave part of the staging arrays unwritten.
+void dispatchKernelEx(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSize grid_size, MTLSize thread_group_size, bool by_threadgroups, std::vector<EncodeArg> args) {
     // Dispatch the kernel
     dispatch_sync(ctx->d_queue, ^(){
+        // Get a reference to the command buffer for the MPS stream
+        id<MTLCommandBuffer> command_buffer = torch::mps::get_command_buffer();
+        TORCH_CHECK(command_buffer, "Failed to retrieve command buffer reference");
+
         // Start a compute pass
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         TORCH_CHECK(encoder, "Failed to create compute command encoder");
@@ -222,12 +236,23 @@ void dispatchKernel(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSize
         }
 
         // Dispatch the compute command
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
+        if (by_threadgroups) {
+            [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:thread_group_size];
+        } else {
+            [encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
+        }
         [encoder endEncoding];
 
-        // Commit the work
-        torch::mps::synchronize();
+        // Submit the work without blocking. Command buffers on the MPS queue
+        // execute in commit order, so anything PyTorch enqueues afterwards
+        // still observes our results; waiting here would idle the GPU between
+        // every kernel launch.
+        torch::mps::commit();
     });
+}
+
+void dispatchKernel(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSize grid_size, MTLSize thread_group_size, std::vector<EncodeArg> args) {
+    dispatchKernelEx(ctx, cpso, grid_size, thread_group_size, false, args);
 }
 
 std::tuple<
@@ -574,6 +599,50 @@ std::tuple<
     const int img_width = std::get<0>(img_size);
     const int img_height = std::get<1>(img_size);
 
+    uint32_t img_size_dim3[4] = {(uint32_t)std::get<0>(img_size), (uint32_t)std::get<1>(img_size), (uint32_t)std::get<2>(img_size), 0xDEAD};
+    uint32_t tile_bounds_arr[4] = {
+        (uint32_t)std::get<0>(tile_bounds),
+        (uint32_t)std::get<1>(tile_bounds),
+        (uint32_t)std::get<2>(tile_bounds),
+        0xDEAD
+    };
+    int32_t block_size_dim2[2] = {std::get<0>(block), std::get<1>(block)};
+
+    MetalContext* ctx = get_global_context();
+
+    if (channels == 3 && block_size_dim2[0] == BLOCK_X && block_size_dim2[1] == BLOCK_Y) {
+        // Fast path: the tiled kernel writes every output element, so the
+        // buffers do not need to be zeroed first.
+        torch::Tensor out_img = torch::empty(
+            {img_height, img_width, channels}, xys.options().dtype(torch::kFloat32)
+        );
+        torch::Tensor final_Ts = torch::empty(
+            {img_height, img_width}, xys.options().dtype(torch::kFloat32)
+        );
+        torch::Tensor final_idx = torch::empty(
+            {img_height, img_width}, xys.options().dtype(torch::kInt32)
+        );
+
+        MTLSize groups = MTLSizeMake(tile_bounds_arr[0], tile_bounds_arr[1], 1);
+        MTLSize thread_group_size = MTLSizeMake(BLOCK_X, BLOCK_Y, 1);
+        dispatchKernelEx(ctx, ctx->rasterize_forward_kernel_cpso, groups, thread_group_size, true, {
+            EncodeArg::array(tile_bounds_arr, sizeof(tile_bounds_arr)),
+            EncodeArg::array(img_size_dim3, sizeof(img_size_dim3)),
+            EncodeArg::tensor(gaussian_ids_sorted),
+            EncodeArg::tensor(tile_bins),
+            EncodeArg::tensor(xys),
+            EncodeArg::tensor(conics),
+            EncodeArg::tensor(colors),
+            EncodeArg::tensor(opacities),
+            EncodeArg::tensor(final_Ts),
+            EncodeArg::tensor(final_idx),
+            EncodeArg::tensor(out_img),
+            EncodeArg::tensor(background)
+        });
+
+        return std::make_tuple(out_img, final_Ts, final_idx);
+    }
+
     torch::Tensor out_img = torch::zeros(
         {img_height, img_width, channels}, xys.options().dtype(torch::kFloat32)
     );
@@ -584,16 +653,6 @@ std::tuple<
         {img_height, img_width}, xys.options().dtype(torch::kInt32)
     );
 
-    uint32_t img_size_dim3[4] = {(uint32_t)std::get<0>(img_size), (uint32_t)std::get<1>(img_size), (uint32_t)std::get<2>(img_size), 0xDEAD};
-    uint32_t tile_bounds_arr[4] = {
-        (uint32_t)std::get<0>(tile_bounds), 
-        (uint32_t)std::get<1>(tile_bounds), 
-        (uint32_t)std::get<2>(tile_bounds), 
-        0xDEAD
-    };
-    int32_t block_size_dim2[2] = {std::get<0>(block), std::get<1>(block)};
-
-    MetalContext* ctx = get_global_context();
     MTLSize grid_size = MTLSizeMake(img_width, img_height, 1);
     MTLSize thread_group_size = MTLSizeMake(block_size_dim2[0], block_size_dim2[1], 1);
     dispatchKernel(ctx, ctx->nd_rasterize_forward_kernel_cpso, grid_size, thread_group_size, {
@@ -748,9 +807,9 @@ std::
     };
 
     MetalContext* ctx = get_global_context();
-    MTLSize grid_size = MTLSizeMake(img_width, img_height, 1);
+    MTLSize groups = MTLSizeMake(tile_bounds_arr[0], tile_bounds_arr[1], 1);
     MTLSize thread_group_size = MTLSizeMake(BLOCK_X, BLOCK_Y, 1);
-    dispatchKernel(ctx, ctx->nd_rasterize_backward_kernel_cpso, grid_size, thread_group_size, {
+    dispatchKernelEx(ctx, ctx->nd_rasterize_backward_kernel_cpso, groups, thread_group_size, true, {
         EncodeArg::array(tile_bounds_arr, sizeof(tile_bounds_arr)),
         EncodeArg::array(img_size, sizeof(img_size)),
         EncodeArg::scalar(channels),
@@ -844,9 +903,11 @@ std::
     };
 
     MetalContext* ctx = get_global_context();
-    MTLSize grid_size = MTLSizeMake(img_width, img_height, 1);
+    // Dispatch whole threadgroups: the kernel stages gaussians in threadgroup
+    // memory, which a partial edge threadgroup would leave uninitialized.
+    MTLSize groups = MTLSizeMake(tile_bounds_arr[0], tile_bounds_arr[1], 1);
     MTLSize thread_group_size = MTLSizeMake(BLOCK_X, BLOCK_Y, 1);
-    dispatchKernel(ctx, ctx->rasterize_backward_kernel_cpso, grid_size, thread_group_size, {
+    dispatchKernelEx(ctx, ctx->rasterize_backward_kernel_cpso, groups, thread_group_size, true, {
         EncodeArg::array(tile_bounds_arr, sizeof(tile_bounds_arr)),
         EncodeArg::array(img_size, sizeof(img_size)),
         EncodeArg::tensor(gaussians_ids_sorted),
@@ -875,4 +936,105 @@ std::
     });
 
     return std::make_tuple(v_xy, v_conic, v_colors, v_opacity);
+}
+// Dispatch helper for the flat, one-thread-per-element SSIM kernels.
+static void dispatch1D(MetalContext* ctx, id<MTLComputePipelineState> cpso, int n, std::vector<EncodeArg> args) {
+    MTLSize grid_size = MTLSizeMake(n, 1, 1);
+    NSUInteger threads = MIN(cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
+    dispatchKernel(ctx, cpso, grid_size, MTLSizeMake(threads, 1, 1), args);
+}
+
+torch::Tensor fused_ssim_stack_tensor(
+    const torch::Tensor &x,
+    const torch::Tensor &y
+){
+    CHECK_INPUT(x);
+    CHECK_INPUT(y);
+    const int n = x.numel();
+    torch::Tensor stacked = torch::empty({5 * x.size(0), x.size(1), x.size(2), x.size(3)}, x.options());
+
+    MetalContext* ctx = get_global_context();
+    dispatch1D(ctx, ctx->fused_ssim_stack_kernel_cpso, n, {
+        EncodeArg::scalar(n),
+        EncodeArg::tensor(x),
+        EncodeArg::tensor(y),
+        EncodeArg::tensor(stacked)
+    });
+    return stacked;
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+fused_ssim_pointwise_fwd_tensor(
+    const torch::Tensor &muX,
+    const torch::Tensor &muY,
+    const torch::Tensor &blurY2,
+    const torch::Tensor &blurXY,
+    const torch::Tensor &sigmaX
+){
+    const int n = muX.numel();
+    torch::Tensor S = torch::empty_like(muX);
+    torch::Tensor m1 = torch::empty_like(muX);
+    torch::Tensor m2 = torch::empty_like(muX);
+    torch::Tensor m3 = torch::empty_like(muX);
+
+    MetalContext* ctx = get_global_context();
+    dispatch1D(ctx, ctx->fused_ssim_pointwise_fwd_kernel_cpso, n, {
+        EncodeArg::scalar(n),
+        EncodeArg::tensor(muX),
+        EncodeArg::tensor(muY),
+        EncodeArg::tensor(blurY2),
+        EncodeArg::tensor(blurXY),
+        EncodeArg::tensor(sigmaX),
+        EncodeArg::tensor(S),
+        EncodeArg::tensor(m1),
+        EncodeArg::tensor(m2),
+        EncodeArg::tensor(m3)
+    });
+    return std::make_tuple(S, m1, m2, m3);
+}
+
+torch::Tensor fused_ssim_pointwise_bwd_pre_tensor(
+    const torch::Tensor &g,
+    const torch::Tensor &m1,
+    const torch::Tensor &m2,
+    const torch::Tensor &m3
+){
+    const int n = m1.numel();
+    const int pixels = g.numel();
+    torch::Tensor stacked = torch::empty({3 * m1.size(0), m1.size(1), m1.size(2), m1.size(3)}, m1.options());
+
+    MetalContext* ctx = get_global_context();
+    dispatch1D(ctx, ctx->fused_ssim_pointwise_bwd_pre_kernel_cpso, n, {
+        EncodeArg::scalar(n),
+        EncodeArg::scalar(pixels),
+        EncodeArg::tensor(g),
+        EncodeArg::tensor(m1),
+        EncodeArg::tensor(m2),
+        EncodeArg::tensor(m3),
+        EncodeArg::tensor(stacked)
+    });
+    return stacked;
+}
+
+torch::Tensor fused_ssim_pointwise_bwd_post_tensor(
+    const torch::Tensor &b1,
+    const torch::Tensor &b2,
+    const torch::Tensor &b3,
+    const torch::Tensor &x,
+    const torch::Tensor &y
+){
+    const int n = x.numel();
+    torch::Tensor gradY = torch::empty_like(x);
+
+    MetalContext* ctx = get_global_context();
+    dispatch1D(ctx, ctx->fused_ssim_pointwise_bwd_post_kernel_cpso, n, {
+        EncodeArg::scalar(n),
+        EncodeArg::tensor(b1),
+        EncodeArg::tensor(b2),
+        EncodeArg::tensor(b3),
+        EncodeArg::tensor(x),
+        EncodeArg::tensor(y),
+        EncodeArg::tensor(gradY)
+    });
+    return gradY;
 }

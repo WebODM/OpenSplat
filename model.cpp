@@ -1122,15 +1122,25 @@ int Model::loadPly(const std::string &filename){
 
 torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, torch::Tensor &mask, float ssimWeight){
     bool hasMask = mask.defined() && mask.numel() > 0;
-    torch::Tensor w = hasMask ? mask : torch::ones({gt.size(0), gt.size(1)}, gt.options());
+    // Without a mask the weights are all ones, so skip materializing them and
+    // the full-image multiplies they would add to both passes.
+    torch::Tensor w = hasMask ? mask : torch::Tensor();
 
-    torch::Tensor l1Loss = (w.unsqueeze(-1) * torch::abs(gt - rgb)).sum() / (w.sum() * gt.size(2) + 1e-8f);
+    torch::Tensor absDiff = torch::abs(gt - rgb);
+    torch::Tensor l1Loss = hasMask
+        ? (w.unsqueeze(-1) * absDiff).sum() / (w.sum() * gt.size(2) + 1e-8f)
+        : absDiff.sum() / (static_cast<float>(gt.numel()) + 1e-8f);
 
     torch::Tensor ssimMap = ssim.map(rgb, gt);
     int pad = ssim.getWindowSize() / 2;
-    torch::Tensor wv = w.index({Slice(pad, w.size(0) - pad), Slice(pad, w.size(1) - pad)});
     torch::Tensor sv = ssimMap.index({Slice(pad, ssimMap.size(0) - pad), Slice(pad, ssimMap.size(1) - pad)});
-    torch::Tensor dssim = (wv * (1.0f - sv)).sum() / (wv.sum() + 1e-8f);
+    torch::Tensor dssim;
+    if (hasMask){
+        torch::Tensor wv = w.index({Slice(pad, w.size(0) - pad), Slice(pad, w.size(1) - pad)});
+        dssim = (wv * (1.0f - sv)).sum() / (wv.sum() + 1e-8f);
+    }else{
+        dssim = (1.0f - sv).sum() / (static_cast<float>(sv.numel()) + 1e-8f);
+    }
 
     torch::Tensor loss = (1.0f - ssimWeight) * l1Loss + ssimWeight * dssim;
 

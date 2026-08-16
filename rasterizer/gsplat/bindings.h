@@ -23,6 +23,10 @@ std::tuple<
     torch::Tensor> // output radii
 compute_cov2d_bounds_tensor(const int num_pts, torch::Tensor &A);
 
+torch::Tensor fused_ssim_stack_tensor(
+    const torch::Tensor &x,
+    const torch::Tensor &y);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 fused_ssim_pointwise_fwd_tensor(
     const torch::Tensor &muX,

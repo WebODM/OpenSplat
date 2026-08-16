@@ -23,6 +23,24 @@
 
 namespace cg = cooperative_groups;
 
+// Builds the [5C,1,H,W] blur input (x, y, x*x, y*y, x*y) in a single pass.
+__global__ void fused_ssim_stack_kernel(
+    const int n,
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    float* __restrict__ stacked
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float xi = x[i];
+    const float yi = y[i];
+    stacked[i] = xi;
+    stacked[n + i] = yi;
+    stacked[2 * n + i] = xi * xi;
+    stacked[3 * n + i] = yi * yi;
+    stacked[4 * n + i] = xi * yi;
+}
+
 __global__ void fused_ssim_pointwise_fwd_kernel(
     const int n,
     const float* __restrict__ muX,
@@ -87,6 +105,18 @@ __global__ void fused_ssim_pointwise_bwd_post_kernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     gradY[i] = b1[i] + 2.f * y[i] * b2[i] + x[i] * b3[i];
+}
+
+torch::Tensor fused_ssim_stack_tensor(
+    const torch::Tensor &x,
+    const torch::Tensor &y
+){
+    const int n = x.numel();
+    torch::Tensor stacked = torch::empty({5 * x.size(0), x.size(1), x.size(2), x.size(3)}, x.options());
+    fused_ssim_stack_kernel<<<(n + 255) / 256, 256>>>(
+        n, x.data_ptr<float>(), y.data_ptr<float>(), stacked.data_ptr<float>()
+    );
+    return stacked;
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
