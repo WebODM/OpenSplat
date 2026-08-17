@@ -18,6 +18,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # Read version
 file(READ "VERSION" APP_VERSION)
+string(STRIP "${APP_VERSION}" APP_VERSION)
 
 # Read git commit
 set(GIT_REV "")

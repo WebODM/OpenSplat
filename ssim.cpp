@@ -21,9 +21,30 @@ using namespace torch::indexing;
 
 namespace {
 
+// One axis of the separable blur, written as a weighted sum of shifted slices.
+torch::Tensor blurAxisShifted(const torch::Tensor &t, const torch::Tensor &w, int64_t dim, int windowSize){
+    namespace F = torch::nn::functional;
+    const int64_t pad = windowSize / 2;
+    torch::Tensor padded = dim == 2
+        ? F::pad(t, F::PadFuncOptions({0, 0, pad, pad}))
+        : F::pad(t, F::PadFuncOptions({pad, pad, 0, 0}));
+
+    torch::Tensor taps = w.reshape({windowSize}).to(torch::kCPU).contiguous();
+    auto tap = taps.accessor<float, 1>();
+
+    torch::Tensor out = torch::zeros_like(t);
+    for (int k = 0; k < windowSize; k++){
+        out.add_(padded.narrow(dim, k, t.size(dim)), tap[k]);
+    }
+    return out;
+}
+
 // Batched separable gaussian blur over [N,1,H,W]
 torch::Tensor blurBatched(const torch::Tensor &t, const torch::Tensor &wV, const torch::Tensor &wH, int windowSize){
     namespace F = torch::nn::functional;
+    if (t.device().is_cpu()){
+        return blurAxisShifted(blurAxisShifted(t, wV, 2, windowSize), wH, 3, windowSize);
+    }
     torch::Tensor v = F::conv2d(t, wV, F::Conv2dFuncOptions().padding({windowSize / 2, 0}));
     return F::conv2d(v, wH, F::Conv2dFuncOptions().padding({0, windowSize / 2}));
 }

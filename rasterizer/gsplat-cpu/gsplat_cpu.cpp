@@ -10,8 +10,48 @@
 #include <iostream>
 #include <cmath>
 #include <tuple>
+#include <thread>
+#include <atomic>
 
 using namespace torch::indexing;
+
+namespace {
+
+int rasterWorkers(int height, size_t floatsPerWorker = 0){
+    int workers = static_cast<int>((std::max)(1u, std::thread::hardware_concurrency()));
+    workers = (std::min)(workers, (std::max)(1, height));
+    if (floatsPerWorker > 0){
+        const size_t budget = 64ull << 20;
+        const int maxWorkers = (std::max)(1, static_cast<int>(budget / (floatsPerWorker * sizeof(float) + 1)));
+        workers = (std::min)(workers, maxWorkers);
+    }
+    return workers;
+}
+
+// Runs fn(chunk, slot) for every chunk in [0, numChunks)
+template <typename F>
+void parallelChunks(int numChunks, int numWorkers, const F &fn){
+    if (numWorkers <= 1){
+        for (int c = 0; c < numChunks; c++) fn(c, 0);
+        return;
+    }
+    std::atomic<int> next(0);
+    auto worker = [&](int slot){
+        int c;
+        while ((c = next.fetch_add(1, std::memory_order_relaxed)) < numChunks) fn(c, slot);
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(numWorkers - 1);
+    for (int t = 1; t < numWorkers; t++){
+        threads.emplace_back([&worker, t](){ worker(t); });
+    }
+    worker(0);
+    for (std::thread &t : threads) t.join();
+}
+
+const int CHUNKS_PER_WORKER = 4;
+
+}
 
 torch::Tensor quatToRot(const torch::Tensor &quat){
     auto u = torch::unbind(torch::nn::functional::normalize(quat, torch::nn::functional::NormalizeFuncOptions().dim(-1)), -1);
@@ -125,7 +165,7 @@ project_gaussians_forward_tensor_cpu(
     torch::Tensor xys = torch::stack({u, v}, -1); // center
 
     torch::Tensor radii = radius.to(torch::kInt32);
-    torch::Tensor camDepths = pProj.index({"...", 2});
+    torch::Tensor camDepths = pView.index({"...", 2}).contiguous();
 
     return std::make_tuple(xys, radii, conic, cov2d, camDepths);
 }
@@ -185,73 +225,90 @@ std::tuple<
 
     const float alphaThresh = 1.0f / 255.0f;
 
-    for (int idx = 0; idx < numPoints; idx++){
-        int32_t gaussianId = gIndices[idx];
+    const int numWorkers = rasterWorkers(height);
+    const int numBands = (std::min)(height, numWorkers * CHUNKS_PER_WORKER);
 
-        float A = pConics[gaussianId * 3 + 0];
-        float B = pConics[gaussianId * 3 + 1];
-        float C = pConics[gaussianId * 3 + 2];
+    parallelChunks(numBands, numWorkers, [&](int band, int){
+            for (int idx = 0; idx < numPoints; idx++){
+                int32_t gaussianId = gIndices[idx];
 
-        float gX = pCenters[gaussianId * 2 + 0];
-        float gY = pCenters[gaussianId * 2 + 1];
+                float sqy = pSqCov2dY[gaussianId];
+                float gY = pCenters[gaussianId * 2 + 1];
 
-        float sqx = pSqCov2dX[gaussianId];
-        float sqy = pSqCov2dY[gaussianId];
-        
-        int minx = (std::max)(0, static_cast<int>(std::floor(gY - sqy)) - 2);
-        int maxx = (std::min)(height, static_cast<int>(std::ceil(gY + sqy)) + 2);
-        int miny = (std::max)(0, static_cast<int>(std::floor(gX - sqx)) - 2);
-        int maxy = (std::min)(width, static_cast<int>(std::ceil(gX + sqx)) + 2);
-        
-        for (int i = minx; i < maxx; i++){
-            for (int j = miny; j < maxy; j++){
-                size_t pixIdx = (i * width + j);
-                if (pDone[pixIdx]) continue;
+                int minx = (std::max)(0, static_cast<int>(std::floor(gY - sqy)) - 2);
+                int maxx = (std::min)(height, static_cast<int>(std::ceil(gY + sqy)) + 2);
+                // first row >= minx that belongs to this band
+                minx += ((band - minx) % numBands + numBands) % numBands;
+                if (minx >= maxx) continue;
 
-                float xCam = gX - j;
-                float yCam = gY - i;
-                float sigma = (
-                    0.5f
-                    * (A * xCam * xCam + C * yCam * yCam)
-                    + B * xCam * yCam
-                );
+                float sqx = pSqCov2dX[gaussianId];
+                float gX = pCenters[gaussianId * 2 + 0];
 
-                if (sigma < 0.0f) continue;
-                float alpha = (std::min)(0.999f, (pOpacities[gaussianId] * std::exp(-sigma)));
-                if (alpha < alphaThresh) continue;
+                int miny = (std::max)(0, static_cast<int>(std::floor(gX - sqx)) - 2);
+                int maxy = (std::min)(width, static_cast<int>(std::ceil(gX + sqx)) + 2);
+                if (miny >= maxy) continue;
 
-                float T = pFinalTs[pixIdx];
-                float nextT = T * (1.0f - alpha);
-                if (nextT <= 1e-4f) { // this pixel is done
-                    pDone[pixIdx] = true;
-                    continue;
+                float A = pConics[gaussianId * 3 + 0];
+                float B = pConics[gaussianId * 3 + 1];
+                float C = pConics[gaussianId * 3 + 2];
+
+                const float opacity = pOpacities[gaussianId];
+                const float r = pColors[gaussianId * 3 + 0];
+                const float g = pColors[gaussianId * 3 + 1];
+                const float b = pColors[gaussianId * 3 + 2];
+                const float sigmaCut = opacity > 0.0f
+                    ? std::log(255.0f * opacity) + 1e-3f
+                    : -1.0f;
+
+                for (int i = minx; i < maxx; i += numBands){
+                    for (int j = miny; j < maxy; j++){
+                        size_t pixIdx = (i * width + j);
+                        if (pDone[pixIdx]) continue;
+
+                        float xCam = gX - j;
+                        float yCam = gY - i;
+                        float sigma = (
+                            0.5f
+                            * (A * xCam * xCam + C * yCam * yCam)
+                            + B * xCam * yCam
+                        );
+
+                        if (sigma < 0.0f) continue;
+                        if (sigma > sigmaCut) continue;
+                        float alpha = (std::min)(0.999f, (opacity * std::exp(-sigma)));
+                        if (alpha < alphaThresh) continue;
+
+                        float T = pFinalTs[pixIdx];
+                        float nextT = T * (1.0f - alpha);
+                        if (nextT <= 1e-4f) { // this pixel is done
+                            pDone[pixIdx] = true;
+                            continue;
+                        }
+
+                        float vis = alpha * T;
+
+                        pOutImg[pixIdx * 3 + 0] += vis * r;
+                        pOutImg[pixIdx * 3 + 1] += vis * g;
+                        pOutImg[pixIdx * 3 + 2] += vis * b;
+
+                        pFinalTs[pixIdx] = nextT;
+                        px2gid[pixIdx].push_back(gaussianId);
+                    }
                 }
-
-                float vis = alpha * T;
-
-                pOutImg[pixIdx * 3 + 0] += vis * pColors[gaussianId * 3 + 0];
-                pOutImg[pixIdx * 3 + 1] += vis * pColors[gaussianId * 3 + 1];
-                pOutImg[pixIdx * 3 + 2] += vis * pColors[gaussianId * 3 + 2];
-                
-                pFinalTs[pixIdx] = nextT;
-                px2gid[pixIdx].push_back(gaussianId);
             }
-        }
-    }
 
-    // Background
-    for (int i = 0; i < height; i++){
-        for (int j = 0; j < width; j++){
-            size_t pixIdx = (i * width + j);
-            float T = pFinalTs[pixIdx];
+            // Background
+            for (int i = band; i < height; i += numBands){
+                for (int j = 0; j < width; j++){
+                    size_t pixIdx = (i * width + j);
+                    float T = pFinalTs[pixIdx];
 
-            pOutImg[pixIdx * 3 + 0] += T * bgX;
-            pOutImg[pixIdx * 3 + 1] += T * bgY;
-            pOutImg[pixIdx * 3 + 2] += T * bgZ;
-
-            std::reverse(px2gid[pixIdx].begin(), px2gid[pixIdx].end());
-        }
-    }
+                    pOutImg[pixIdx * 3 + 0] += T * bgX;
+                    pOutImg[pixIdx * 3 + 1] += T * bgY;
+                    pOutImg[pixIdx * 3 + 2] += T * bgZ;
+                }
+            }
+    });
 
     return std::make_tuple(outImg, finalTs, px2gid);
 }
@@ -289,16 +346,6 @@ std::
     int channels = colors.size(1);
     torch::Device device = xys.device();
 
-    torch::Tensor v_xy = torch::zeros({numPoints, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(device));   
-    torch::Tensor v_conic = torch::zeros({numPoints, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor v_colors = torch::zeros({numPoints, channels}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor v_opacity = torch::zeros({numPoints, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-
-    float *pv_xy = static_cast<float *>(v_xy.data_ptr());
-    float *pv_conic = static_cast<float *>(v_conic.data_ptr());
-    float *pv_colors = static_cast<float *>(v_colors.data_ptr());
-    float *pv_opacity = static_cast<float *>(v_opacity.data_ptr());
-    
     float *pColors = static_cast<float *>(colors.data_ptr());
     float *pv_output = static_cast<float *>(v_output.data_ptr());
     float *pv_outputAlpha = static_cast<float *>(v_output_alpha.data_ptr());
@@ -311,21 +358,51 @@ std::
     float bgZ = background[2].item<float>();
 
     float *pFinalTs = static_cast<float *>(final_Ts.data_ptr());
-    float *pDinfo = densification_info.numel() > 0 ? static_cast<float *>(densification_info.data_ptr()) : nullptr;
+    const bool hasDinfo = densification_info.numel() > 0;
     float *pErr = error_map.numel() > 0 ? static_cast<float *>(error_map.data_ptr()) : nullptr;
     float *pEdge = edge_map.numel() > 0 ? static_cast<float *>(edge_map.data_ptr()) : nullptr;
-    float *pXyAbs = v_xy_abs.numel() > 0 ? static_cast<float *>(v_xy_abs.data_ptr()) : nullptr;
+    const bool hasXyAbs = v_xy_abs.numel() > 0;
 
     const float alphaThresh = 1.0f / 255.0f;
 
-    for (int i = 0; i < height; i++){
+    auto fOpts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    const size_t floatsPerWorker = static_cast<size_t>(numPoints) *
+        (2 + 3 + channels + 1 + (hasDinfo ? 4 : 0) + (hasXyAbs ? 2 : 0));
+    const int numWorkers = rasterWorkers(height, floatsPerWorker);
+    const int numBands = (std::min)(height, numWorkers * CHUNKS_PER_WORKER);
+
+    torch::Tensor v_xy_b = torch::zeros({numWorkers, numPoints, 2}, fOpts);
+    torch::Tensor v_conic_b = torch::zeros({numWorkers, numPoints, 3}, fOpts);
+    torch::Tensor v_colors_b = torch::zeros({numWorkers, numPoints, channels}, fOpts);
+    torch::Tensor v_opacity_b = torch::zeros({numWorkers, numPoints, 1}, fOpts);
+    torch::Tensor dinfo_b = torch::zeros({numWorkers, hasDinfo ? 4 : 0, numPoints}, fOpts);
+    torch::Tensor xyAbs_b = torch::zeros({numWorkers, hasXyAbs ? numPoints : 0, 2}, fOpts);
+
+    float *pv_xy_b = static_cast<float *>(v_xy_b.data_ptr());
+    float *pv_conic_b = static_cast<float *>(v_conic_b.data_ptr());
+    float *pv_colors_b = static_cast<float *>(v_colors_b.data_ptr());
+    float *pv_opacity_b = static_cast<float *>(v_opacity_b.data_ptr());
+    float *pDinfo_b = hasDinfo ? static_cast<float *>(dinfo_b.data_ptr()) : nullptr;
+    float *pXyAbs_b = hasXyAbs ? static_cast<float *>(xyAbs_b.data_ptr()) : nullptr;
+
+    parallelChunks(numBands, numWorkers, [&](int band, int slot){
+        float *pv_xy = pv_xy_b + static_cast<size_t>(slot) * numPoints * 2;
+        float *pv_conic = pv_conic_b + static_cast<size_t>(slot) * numPoints * 3;
+        float *pv_colors = pv_colors_b + static_cast<size_t>(slot) * numPoints * channels;
+        float *pv_opacity = pv_opacity_b + static_cast<size_t>(slot) * numPoints;
+        float *pDinfo = pDinfo_b ? pDinfo_b + static_cast<size_t>(slot) * numPoints * 4 : nullptr;
+        float *pXyAbs = pXyAbs_b ? pXyAbs_b + static_cast<size_t>(slot) * numPoints * 2 : nullptr;
+
+        for (int i = static_cast<int>(band); i < height; i += numBands){
         for (int j = 0; j < width; j++){
             size_t pixIdx = (i * width + j);
             float Tfinal = pFinalTs[pixIdx];
             float T = Tfinal;
             float buffer[3] = {0.0f, 0.0f, 0.0f};
 
-            for (const int32_t &gaussianId : px2gid[pixIdx]){
+            const std::vector<int32_t> &gids = px2gid[pixIdx];
+            for (auto it = gids.rbegin(); it != gids.rend(); ++it){
+                const int32_t gaussianId = *it;
                 float A = pConics[gaussianId * 3 + 0];
                 float B = pConics[gaussianId * 3 + 1];
                 float C = pConics[gaussianId * 3 + 2];
@@ -390,7 +467,15 @@ std::
                 pv_opacity[gaussianId] += vis * v_alpha;
             }
         }
-    }
+        }
+    });
+
+    torch::Tensor v_xy = v_xy_b.sum(0);
+    torch::Tensor v_conic = v_conic_b.sum(0);
+    torch::Tensor v_colors = v_colors_b.sum(0);
+    torch::Tensor v_opacity = v_opacity_b.sum(0);
+    if (hasDinfo) densification_info.add_(dinfo_b.sum(0));
+    if (hasXyAbs) v_xy_abs.add_(xyAbs_b.sum(0));
 
     return std::make_tuple(v_xy, v_conic, v_colors, v_opacity);
 }
