@@ -11,8 +11,6 @@ Graphics card recommended, but not required! OpenSplat runs the fastest on NVIDI
 
 Commercial use allowed and encouraged under the terms of the [AGPLv3](https://www.tldrlegal.com/license/gnu-affero-general-public-license-v3-agpl-3-0). ✅
 
-We even have a [song](https://youtu.be/1bma7XJkoDM) 🎵
-
 ## Getting Started
 
 If you're on Windows, you can [buy](http://sites.fastspring.com/masseranolabs/product/opensplatforwindows) the pre-built program. This saves you time and helps support the project ❤️. Then jump directly to the [run](#run) section. As an alternative, check the [build](#build) section below.
