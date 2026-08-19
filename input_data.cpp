@@ -95,11 +95,8 @@ void Camera::loadImage(float downscaleFactor){
     }
 
     if (hasDistortionParameters()){
-        if (k4 != 0.0f || k5 != 0.0f || k6 != 0.0f){
-            std::cout << "Warning: k4/k5/k6 distortion coefficients are ignored" << std::endl;
-        }
         UndistortParams p = computeUndistortParams(fx, fy, cx, cy, cImg.cols, cImg.rows,
-                                                   k1, k2, k3, p1, p2);
+                                                   k1, k2, k3, k4, k5, k6, p1, p2);
         cv::Mat mapx, mapy;
         buildUndistortMaps(p, mapx, mapy);
         cv::Mat undistorted;
