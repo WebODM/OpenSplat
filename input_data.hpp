@@ -28,7 +28,6 @@ struct Camera{
     torch::Tensor camToWorld;
     std::string filePath = "";
     std::string maskPath = "";
-    bool invertMask = false;
     CameraType cameraType = CameraType::Perspective;
 
     Camera(){};

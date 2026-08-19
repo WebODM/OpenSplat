@@ -912,8 +912,6 @@ kernel void get_tile_bin_edges_kernel(
     }
 }
 
-// SIMD-group reductions. Apple GPUs implement these natively, so they are
-// considerably cheaper than an unrolled butterfly of simd_shuffle_xor().
 inline int warp_reduce_all_max(int val, const int warp_size) {
     return simd_max(val);
 }
@@ -941,9 +939,6 @@ inline float warpSum(float val, const int warp_size, const uint lane) {
 kernel void rasterize_backward_kernel(
     constant uint3& tile_bounds,
     constant uint2& img_size,
-    // These are indexed divergently (per gaussian / per pixel), so they live in
-    // the device address space: the constant address space is optimized for
-    // reads that are uniform across a SIMD-group and is slower here.
     device const int32_t* gaussian_ids_sorted,
     device const int* tile_bins, // int2
     device const float* xys, // float2
@@ -1000,9 +995,6 @@ kernel void rasterize_backward_kernel(
     const int2 range = read_packed_int2(tile_bins, tile_id);
     const int num_batches = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    // packed_float3 (12 bytes) instead of float3 (padded to 16) keeps the
-    // threadgroup allocation at 10KB rather than 13KB, which is what lets a
-    // third threadgroup stay resident per GPU core.
     threadgroup int32_t id_batch[BLOCK_SIZE];
     threadgroup packed_float3 xy_opacity_batch[BLOCK_SIZE];
     threadgroup packed_float3 conic_batch[BLOCK_SIZE];
@@ -1138,11 +1130,6 @@ kernel void rasterize_backward_kernel(
                 v_xy_abs_local = warpSum2(v_xy_abs_local, warp_size, wr);
             }
 
-            // simd_sum() broadcasts the reduced value to every lane, so instead of
-            // having lane 0 issue all of the atomics back-to-back we hand one
-            // component to each of the first n_slots lanes and issue them with a
-            // single atomic instruction. Same number of memory transactions, but
-            // ~10x fewer instructions and all of them in flight at once.
             const int dens_base = 9;
             const int abs_base = dens_base + (has_densification != 0 ? 4 : 0);
             const int n_slots = abs_base + (has_xy_abs != 0 ? 2 : 0);
@@ -1590,12 +1577,6 @@ kernel void compute_cov2d_bounds_kernel(
     conics[index + 2] = conic.z;
     radii[row] = radius;
 }
-
-// ---------------------------------------------------------------------------
-// Fused SSIM helpers (Metal port of the CUDA kernels in gsplat/bindings.cu).
-// The unfused formulation costs ~40 separate MPS elementwise kernels over
-// multi-hundred-megabyte tensors, which dominates training time on MPS.
-// ---------------------------------------------------------------------------
 
 // Builds the [5C,1,H,W] blur input (x, y, x*x, y*y, x*y) in a single pass.
 kernel void fused_ssim_stack_kernel(

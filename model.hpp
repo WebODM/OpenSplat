@@ -17,7 +17,6 @@ using namespace torch::autograd;
 torch::Tensor randomQuatTensor(long long n);
 torch::Tensor identityQuatTensor(long long n);
 torch::Tensor mrnfKnnLogScales(const torch::Tensor &xyz);
-torch::Tensor gumbelTopK(const torch::Tensor &weights, int k);
 torch::Tensor projectionMatrix(float zNear, float zFar, float fovX, float fovY, const torch::Device &device);
 torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt);
 torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt);

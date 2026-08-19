@@ -152,7 +152,6 @@ elseif(GPU_RUNTIME STREQUAL "HIP")
     endif()
     list(APPEND CMAKE_PREFIX_PATH "${ROCM_ROOT}")
 elseif(GPU_RUNTIME STREQUAL "MPS")
-    # The Metal shader compiler ships with Xcode, not with the command line tools
     execute_process(COMMAND xcrun -sdk macosx metal --version
                     RESULT_VARIABLE METAL_COMPILER_RESULT
                     OUTPUT_QUIET ERROR_QUIET)

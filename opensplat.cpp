@@ -42,7 +42,6 @@ int main(int argc, char *argv[]){
         ("opacity-reg", "Opacity regularization weight (penalizes haze/floaters, 0 to disable)", cxxopts::value<float>()->default_value("0.01"))
         ("no-edge-guidance", "Disable Canny edge weighting of the densification importance", cxxopts::value<bool>()->default_value("false"))
         ("max-gaussians", "Maximum number of gaussians (0 = unlimited)", cxxopts::value<int>()->default_value("5000000"))
-        ("invert-masks", "Invert image masks (swap object/background)", cxxopts::value<bool>()->default_value("false"))
         ("no-masks", "Ignore image masks even when present", cxxopts::value<bool>()->default_value("false"))
         ("no-gpu-cache", "Do not cache images/masks on the GPU (reduces VRAM usage, slower)", cxxopts::value<bool>()->default_value("false"))
 #ifdef USE_VISUALIZATION
@@ -95,7 +94,6 @@ int main(int argc, char *argv[]){
     if (densifyUntil < 0) densifyUntil = (std::min)(15000, result["num-iters"].as<int>() / 2);
     const float lossThresh = result["loss-thresh"].as<float>();
     const int maxGaussians = result["max-gaussians"].as<int>();
-    const bool invertMasks = result["invert-masks"].as<bool>();
     const bool noMasks = result["no-masks"].as<bool>();
     #ifdef USE_VISUALIZATION
         const bool hasVisualization = result["has-visualization"].as<bool>();
@@ -130,7 +128,6 @@ int main(int argc, char *argv[]){
         if (!noMasks){
             for (Camera &cam : inputData.cameras){
                 cam.maskPath = findMaskPath(cam.filePath, projectPath);
-                cam.invertMask = invertMasks;
                 if (!cam.maskPath.empty()) numMasks++;
             }
         }

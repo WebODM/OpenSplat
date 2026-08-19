@@ -44,9 +44,6 @@ torch::Tensor identityQuatTensor(long long n){
     return q;
 }
 
-// MRNF scale init (port of LichtFeld compute_mrnf_knn_log_scales):
-// isotropic log-scale from the mean of the 2 nearest neighbor distances,
-// clamped by a percentile-based scene size
 torch::Tensor mrnfKnnLogScales(const torch::Tensor &xyz){
     long long n = xyz.size(0);
     torch::Tensor lo = std::get<0>(xyz.kthvalue((std::max)(static_cast<long long>(1), static_cast<long long>(0.125 * n)), 0));
@@ -73,15 +70,6 @@ torch::Tensor mrnfKnnLogScales(const torch::Tensor &xyz){
     }
     pt.freeIndex<KdTreeTensor>();
     return dists.log();
-}
-
-torch::Tensor gumbelTopK(const torch::Tensor &weights, int k){
-    if (k <= 0) return torch::empty({0}, torch::TensorOptions().dtype(torch::kLong).device(weights.device()));
-    torch::Tensor u = torch::rand_like(weights).clamp(1e-10f, 1.0f - 1e-7f);
-    torch::Tensor keys = torch::where(weights > 0,
-        torch::log(weights.clamp_min(1e-30f)) - torch::log(-torch::log(u)),
-        torch::full_like(weights, -1e30f));
-    return std::get<1>(keys.topk(k));
 }
 
 torch::Tensor projectionMatrix(float zNear, float zFar, float fovX, float fovY, const torch::Device &device){
@@ -115,7 +103,6 @@ std::vector<T> tensor_to_vector(const torch::Tensor t){
 void Model::setupOptimizers(){
     releaseOptimizers();
 
-    // FastGS learning rates
     const double eps = 1e-15;
     meansOpt = new torch::optim::Adam({means}, torch::optim::AdamOptions(1.6e-4 * spatialLrScale).eps(eps));
     scalesOpt = new torch::optim::Adam({scales}, torch::optim::AdamOptions(5e-3).eps(eps));
@@ -254,15 +241,12 @@ torch::Tensor Model::forward(Camera& cam, int step){
     if (!scoringPass){
         errorMap = torch::empty({0}, fOpts);
         densificationInfo = torch::empty({0}, fOpts);
-        // Abs-GS screen-gradient accumulation while densification is active
         xyAbsGrad = step <= densifyUntilIter ? torch::zeros({means.size(0), 2}, fOpts)
                                              : torch::empty({0}, fOpts);
     }else if (edgeGuidance){
-        // Scoring pass: edge-weighted blending accumulates in densification_info row 2
         camEdgeMap = cam.getEdgeMapGpu(getDownscaleFactor(step), device);
     }
-    // During scoring passes, errorMap/densificationInfo are managed by computeMultiViewScores
-
+    
     if (device == torch::kCPU){
         auto rast = RasterizeGaussiansCPU::apply(
                 xys,
@@ -331,14 +315,11 @@ static void setOptimizerLr(torch::optim::Adam *opt, double lr){
 }
 
 void Model::schedulersStep(int step){
-    // Exponential position LR decay 1.6e-4 -> 1.6e-6 (x spatialLrScale)
     double t = std::clamp(static_cast<double>(step) / maxSteps, 0.0, 1.0);
     double lr = std::exp(std::log(1.6e-4) * (1.0 - t) + std::log(1.6e-6) * t) * spatialLrScale;
     setOptimizerLr(meansOpt, lr);
 }
 
-// FastGS optimizer cadence: SH-rest at 1/16 before densifyUntil; everything at
-// 1/32 until 20k, then 1/64. Gradients accumulate between steps.
 void Model::optimizerStepCadence(int step){
     auto stepAndZero = [](torch::optim::Adam *opt){
         opt->step();
@@ -443,9 +424,7 @@ void Model::zeroOptimizerRows(torch::optim::Adam *optimizer, const torch::Tensor
 }
 
 
-// FastGS (arXiv 2511.04283) multi-view consistency scoring:
-// render sampled views, threshold the min-max normalized per-pixel L1 map,
-// count high-error pixels within each gaussian's blended footprint
+// Inspired by FastGS
 std::tuple<torch::Tensor, torch::Tensor> Model::computeMultiViewScores(int step, bool densify){
     long long N = means.size(0);
     auto fOpts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
@@ -503,8 +482,6 @@ std::tuple<torch::Tensor, torch::Tensor> Model::computeMultiViewScores(int step,
     if (densify){
         importance = (fullCounts / static_cast<float>(numViews)).floor();
         if (edgeGuidance){
-            // Bias densification toward image edges (combats blur):
-            // factor = 1 + 0.25 * median-normalized edge score
             torch::Tensor pos = edgeScores.index({edgeScores > 0});
             if (pos.numel() > 0){
                 importance = importance * (1.0f + 0.25f * edgeScores / pos.median().clamp_min(1e-12f));
@@ -525,8 +502,6 @@ void Model::resetOpacity(float value){
     zeroOptimizerRows(opacitiesOpt, allIdx);
 }
 
-// Escaped or exploded splats relative to a percentile scene AABB
-// (robust to the floaters it is meant to catch)
 static torch::Tensor spatialSanityMask(const torch::Tensor &means, const torch::Tensor &scales, const torch::Device &device){
     torch::NoGradGuard noGrad;
     torch::Tensor mc = means.detach().cpu();
@@ -583,7 +558,7 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
         addToOptimizer(opacitiesOpt, opacities, cloneIdx, 1);
     }
 
-    // Split: two samples from the gaussian, scale / 1.6, parent pruned below
+    // Split
     long long nAfterClone = means.size(0);
     torch::Tensor splitIdx = torch::where(splitMask)[0];
     long long nSplits = splitIdx.numel();
@@ -620,20 +595,17 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
     long long N = means.size(0);
     auto boolOpts = torch::TensorOptions().dtype(torch::kBool).device(device);
 
-    // Split parents must go; escaped/exploded splats are pruned unconditionally
     torch::Tensor parentMask = torch::zeros({N}, boolOpts);
     if (nSplits > 0) parentMask.index_put_({splitIdx}, true);
     torch::Tensor sanityMask = spatialSanityMask(means, scales, device);
 
-    // Targeted pruning: opacity/size candidates, remove only half of them,
-    // sampled by inverse (1 - pruning_score)
     torch::Tensor pruneMask = (torch::sigmoid(opacities.squeeze(-1)) < 0.005f);
     if (step > opacityResetInterval && maxRadii2D.defined() && maxRadii2D.size(0) >= numPointsBefore){
         torch::Tensor big2D = torch::zeros({N}, boolOpts);
         big2D.index_put_({Slice(None, numPointsBefore)}, maxRadii2D.index({Slice(None, numPointsBefore)}) > 20.0f);
         pruneMask |= big2D | (std::get<0>(scales.exp().max(-1)) > 0.1f * spatialLrScale);
     }
-    pruneMask &= ~parentMask; // parents handled separately
+    pruneMask &= ~parentMask;
 
     long long removeBudget = pruneMask.sum().item<long long>() / 2;
     torch::Tensor finalPrune = parentMask | sanityMask;
@@ -665,7 +637,7 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
         removeFromOptimizer(opacitiesOpt, opacities, finalPrune);
     }
 
-    // Opacity cap at 0.8 after every densification event
+    // Opacity cap at 0.8
     float cap = torch::logit(torch::tensor(0.8f)).item<float>();
     opacities.clamp_max_(cap);
     torch::Tensor allIdx = torch::arange(opacities.size(0), torch::TensorOptions().dtype(torch::kLong).device(device));
@@ -717,8 +689,7 @@ bool Model::afterTrain(int step){
             std::cout << "Opacity reset" << std::endl;
         }
     }else if (step % 3000 == 0 && step > densifyUntilIter && step < maxSteps && trainCams != nullptr){
-        // Final multi-view pruning: the model has converged enough for
-        // aggressive removal
+        // Final pruning
         auto scores = computeMultiViewScores(step, false);
         torch::NoGradGuard noGrad;
         torch::Tensor pruningScore = std::get<1>(scores);
@@ -1122,8 +1093,6 @@ int Model::loadPly(const std::string &filename){
 
 torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, torch::Tensor &mask, float ssimWeight){
     bool hasMask = mask.defined() && mask.numel() > 0;
-    // Without a mask the weights are all ones, so skip materializing them and
-    // the full-image multiplies they would add to both passes.
     torch::Tensor w = hasMask ? mask : torch::Tensor();
 
     torch::Tensor absDiff = torch::abs(gt - rgb);
@@ -1144,12 +1113,12 @@ torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, torch::Tens
 
     torch::Tensor loss = (1.0f - ssimWeight) * l1Loss + ssimWeight * dssim;
 
-    // Segment-mode opacity penalty: push alpha to 0 in masked-out areas
+    // Segment-mode opacity penalty: push alpha to 0 in masked areas
     if (hasMask && lastAlpha.defined() && lastAlpha.numel() == w.numel()){
         loss = loss + (lastAlpha * (1.0f - w).pow(2.0f)).mean();
     }
 
-    // Global opacity regularization: taxes haze and unsupported floaters
+    // Global opacity regularization: penalize haze and floaters
     if (opacityReg > 0.0f){
         loss = loss + opacityReg * torch::sigmoid(opacities).mean();
     }

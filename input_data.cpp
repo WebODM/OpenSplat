@@ -88,7 +88,6 @@ void Camera::loadImage(float downscaleFactor){
     }
 
     if (!cMask.empty()){
-        if (invertMask) cMask = 255 - cMask;
         cv::threshold(cMask, cMask, 127, 255, cv::THRESH_BINARY);
         if (cMask.rows != cImg.rows || cMask.cols != cImg.cols){
             cv::resize(cMask, cMask, cv::Size(cImg.cols, cImg.rows), 0.0, 0.0, cv::INTER_LINEAR);
@@ -96,7 +95,6 @@ void Camera::loadImage(float downscaleFactor){
     }
 
     if (hasDistortionParameters()){
-        // COLMAP-style undistortion: focal preserved, canvas rescaled
         if (k4 != 0.0f || k5 != 0.0f || k6 != 0.0f){
             std::cout << "Warning: k4/k5/k6 distortion coefficients are ignored" << std::endl;
         }
@@ -197,8 +195,7 @@ static long long gpuCacheBudget(){
     return 1LL << 30;
 }
 
-// Cache device-side tensors per camera to avoid re-uploading every iteration.
-// Budget-capped; beyond it we fall back to per-iteration uploads.
+// Cache device-side tensors per camera to avoid re-uploading every iteration
 static torch::Tensor gpuCached(std::unordered_map<int, torch::Tensor> &cache, int key,
                                const torch::Tensor &src, const torch::Device &device){
     if (device == torch::kCPU || !Camera::gpuCacheEnabled) return src.to(device);

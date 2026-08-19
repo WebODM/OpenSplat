@@ -195,10 +195,6 @@ private:
     friend void dispatchKernelEx(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSize grid_size, MTLSize thread_group_size, bool by_threadgroups, std::vector<EncodeArg> args);
 };
 
-// grid_size is a thread count when by_threadgroups is false (partial edge
-// threadgroups), or a threadgroup count when it is true. Kernels that stage
-// data in threadgroup memory must use the latter: a partial threadgroup would
-// leave part of the staging arrays unwritten.
 void dispatchKernelEx(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSize grid_size, MTLSize thread_group_size, bool by_threadgroups, std::vector<EncodeArg> args) {
     // Dispatch the kernel
     dispatch_sync(ctx->d_queue, ^(){
@@ -243,10 +239,7 @@ void dispatchKernelEx(MetalContext* ctx, id<MTLComputePipelineState> cpso, MTLSi
         }
         [encoder endEncoding];
 
-        // Submit the work without blocking. Command buffers on the MPS queue
-        // execute in commit order, so anything PyTorch enqueues afterwards
-        // still observes our results; waiting here would idle the GPU between
-        // every kernel launch.
+        // Submit the work without blocking
         torch::mps::commit();
     });
 }
@@ -611,8 +604,6 @@ std::tuple<
     MetalContext* ctx = get_global_context();
 
     if (channels == 3 && block_size_dim2[0] == BLOCK_X && block_size_dim2[1] == BLOCK_Y) {
-        // Fast path: the tiled kernel writes every output element, so the
-        // buffers do not need to be zeroed first.
         torch::Tensor out_img = torch::empty(
             {img_height, img_width, channels}, xys.options().dtype(torch::kFloat32)
         );
@@ -903,8 +894,6 @@ std::
     };
 
     MetalContext* ctx = get_global_context();
-    // Dispatch whole threadgroups: the kernel stages gaussians in threadgroup
-    // memory, which a partial edge threadgroup would leave uninitialized.
     MTLSize groups = MTLSizeMake(tile_bounds_arr[0], tile_bounds_arr[1], 1);
     MTLSize thread_group_size = MTLSizeMake(BLOCK_X, BLOCK_Y, 1);
     dispatchKernelEx(ctx, ctx->rasterize_backward_kernel_cpso, groups, thread_group_size, true, {

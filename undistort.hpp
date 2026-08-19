@@ -3,8 +3,6 @@
 
 #include <opencv2/core/core.hpp>
 
-// COLMAP-style undistortion (port of LichtFeld-Studio / COLMAP UndistortCamera):
-// focal length is preserved, the canvas is rescaled so no blank pixels remain.
 struct UndistortParams{
     float srcFx, srcFy, srcCx, srcCy;
     int srcW, srcH;
