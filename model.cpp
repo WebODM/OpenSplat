@@ -542,7 +542,7 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
     torch::Tensor finalPrune = parentMask | sanityMask;
     if (removeBudget > 0){
         torch::Tensor weights = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        long long S = (std::min)(pruningScore.size(0), N);
+        long long S = (std::min)(static_cast<long long>(pruningScore.size(0)), N);
         weights.index_put_({Slice(None, S)}, 1.0f / (1e-6f + 1.0f - pruningScore.index({Slice(None, S)})));
         torch::Tensor sampledIdx = torch::multinomial(weights.cpu(), removeBudget, false).to(device);
         torch::Tensor sampledMask = torch::zeros({N}, boolOpts);
