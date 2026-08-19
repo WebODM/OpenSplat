@@ -244,6 +244,12 @@ You can resume training of a .PLY file by using the `--resume` option:
 ./opensplat /path/to/banana --resume ./splat.ply
 ```
 
+### Image Masks
+
+You can exclude parts of your images by adding 2D masks. Place them in a `masks` folder (also recognized: `mask`, `segmentation`, `dynamic_masks`) inside your project, named after each image (e.g. `images/IMG_001.JPG` → `masks/IMG_001.png`). Masks are grayscale images matching the input dimensions: white marks pixels to keep, black pixels to ignore.
+
+When masks are found they are applied automatically. Use `--no-masks` to ignore them.
+
 ### AMD GPU Notes
 
 To train a model with AMD GPU using docker container, you can use the following command as a reference:

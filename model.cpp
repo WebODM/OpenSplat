@@ -401,7 +401,7 @@ std::tuple<torch::Tensor, torch::Tensor> Model::computeMultiViewScores(int step,
         torch::Tensor l1Loss = torch::abs(gt - rgb.detach()).mean();
         float photometric = (0.8f * l1Loss + 0.2f * ssimLoss).item<float>();
 
-        torch::Tensor counts = densificationInfo[3];
+        torch::Tensor counts = densificationInfo[3] * static_cast<float>(ds * ds);
         fullCounts += counts;
         fullScore += photometric * counts;
         if (edgeGuidance) edgeScores += densificationInfo[2];
@@ -533,10 +533,8 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
     torch::Tensor sanityMask = spatialSanityMask(means, scales, device);
 
     torch::Tensor pruneMask = (torch::sigmoid(opacities.squeeze(-1)) < 0.005f);
-    if (step > opacityResetInterval && maxRadii2D.defined() && maxRadii2D.size(0) >= numPointsBefore){
-        torch::Tensor big2D = torch::zeros({N}, boolOpts);
-        big2D.index_put_({Slice(None, numPointsBefore)}, maxRadii2D.index({Slice(None, numPointsBefore)}) > 20.0f);
-        pruneMask |= big2D | (std::get<0>(scales.exp().max(-1)) > 0.1f * spatialLrScale);
+    if (step > opacityResetInterval){
+        pruneMask |= (std::get<0>(scales.exp().max(-1)) > 0.1f * spatialLrScale);
     }
     pruneMask &= ~parentMask;
 
