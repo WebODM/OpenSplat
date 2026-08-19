@@ -464,7 +464,7 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
 
     if (maxGaussians > 0){
         long long budget = maxGaussians - numPointsBefore;
-        long long requested = cloneMask.sum().item<long long>() + 2 * splitMask.sum().item<long long>();
+        long long requested = cloneMask.sum().item<int64_t>() + 2 * splitMask.sum().item<int64_t>();
         if (requested > budget){
             cloneMask &= importanceScore > (budget > 0 ? 5.0f : 1e30f);
             if (budget <= 0){
@@ -538,7 +538,7 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
     }
     pruneMask &= ~parentMask;
 
-    long long removeBudget = pruneMask.sum().item<long long>() / 2;
+    long long removeBudget = pruneMask.sum().item<int64_t>() / 2;
     torch::Tensor finalPrune = parentMask | sanityMask;
     if (removeBudget > 0){
         torch::Tensor weights = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
@@ -550,7 +550,7 @@ void Model::densifyAndPrune(int step, const torch::Tensor &importanceScore, cons
         finalPrune |= (pruneMask & sampledMask);
     }
 
-    long long cullCount = finalPrune.sum().item<long long>();
+    long long cullCount = finalPrune.sum().item<int64_t>();
     if (cullCount > 0){
         torch::Tensor keep = ~finalPrune;
         means = means.index({keep}).detach().requires_grad_();
@@ -626,7 +626,7 @@ bool Model::afterTrain(int step){
         torch::Tensor pruningScore = std::get<1>(scores);
         torch::Tensor pruneMask = (torch::sigmoid(opacities.squeeze(-1)) < 0.1f) | (pruningScore > 0.9f)
                                 | spatialSanityMask(means, scales, device);
-        long long cullCount = pruneMask.sum().item<long long>();
+        long long cullCount = pruneMask.sum().item<int64_t>();
         if (cullCount > 0 && cullCount < means.size(0)){
             torch::Tensor keep = ~pruneMask;
             means = means.index({keep}).detach().requires_grad_();
