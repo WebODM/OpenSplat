@@ -27,6 +27,7 @@ struct Camera{
     float p2 = 0;
     torch::Tensor camToWorld;
     std::string filePath = "";
+    std::string maskPath = "";
     CameraType cameraType = CameraType::Perspective;
 
     Camera(){};
@@ -38,14 +39,27 @@ struct Camera{
         camToWorld(camToWorld), filePath(filePath) {}
     torch::Tensor getIntrinsicsMatrix();
     bool hasDistortionParameters();
-    std::vector<float> undistortionParameters();
     torch::Tensor getImage(int downscaleFactor);
+    torch::Tensor getMask(int downscaleFactor);
+    torch::Tensor getEdgeMap(int downscaleFactor);
+    torch::Tensor getImageGpu(int downscaleFactor, const torch::Device &device);
+    torch::Tensor getMaskGpu(int downscaleFactor, const torch::Device &device);
+    torch::Tensor getEdgeMapGpu(int downscaleFactor, const torch::Device &device);
+    bool hasMask() const { return mask.numel() > 0; }
 
     void loadImage(float downscaleFactor);
     torch::Tensor K;
     torch::Tensor image;
+    torch::Tensor mask; // [H,W] float 0/1, aligned with image
 
     std::unordered_map<int, torch::Tensor> imagePyramids;
+    std::unordered_map<int, torch::Tensor> maskPyramids;
+    std::unordered_map<int, torch::Tensor> edgePyramids;
+    std::unordered_map<int, torch::Tensor> gpuImageCache;
+    std::unordered_map<int, torch::Tensor> gpuMaskCache;
+    std::unordered_map<int, torch::Tensor> gpuEdgeCache;
+
+    static bool gpuCacheEnabled;
 };
 
 struct Points{
@@ -63,5 +77,6 @@ struct InputData{
     void saveCameras(const std::string &filename, bool keepCrs);
 };
 InputData inputDataFromX(const std::string &projectRoot);
+std::string findMaskPath(const std::string &imagePath, const std::string &projectRoot);
 
 #endif

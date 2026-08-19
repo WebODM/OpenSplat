@@ -23,6 +23,161 @@
 
 namespace cg = cooperative_groups;
 
+// Builds the [5C,1,H,W] blur input (x, y, x*x, y*y, x*y) in a single pass.
+__global__ void fused_ssim_stack_kernel(
+    const int n,
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    float* __restrict__ stacked
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float xi = x[i];
+    const float yi = y[i];
+    stacked[i] = xi;
+    stacked[n + i] = yi;
+    stacked[2 * n + i] = xi * xi;
+    stacked[3 * n + i] = yi * yi;
+    stacked[4 * n + i] = xi * yi;
+}
+
+__global__ void fused_ssim_pointwise_fwd_kernel(
+    const int n,
+    const float* __restrict__ muX,
+    const float* __restrict__ muY,
+    const float* __restrict__ blurY2,
+    const float* __restrict__ blurXY,
+    const float* __restrict__ sigmaX,
+    float* __restrict__ S,
+    float* __restrict__ m1,
+    float* __restrict__ m2,
+    float* __restrict__ m3
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float c1 = 0.0001f;
+    const float c2 = 0.0009f;
+    float mx = muX[i];
+    float my = muY[i];
+    float sy = blurY2[i] - my * my;
+    float sxy = blurXY[i] - mx * my;
+    float A1 = 2.f * mx * my + c1;
+    float A2 = 2.f * sxy + c2;
+    float B1 = mx * mx + my * my + c1;
+    float B2 = sigmaX[i] + sy + c2;
+    float ib = 1.f / (B1 * B2);
+    float s = A1 * A2 * ib;
+    S[i] = s;
+    float dMu = 2.f * A2 * (mx * B1 - my * A1) * ib / B1;
+    float dSy = -s / B2;
+    float dSxy = 2.f * A1 * ib;
+    m1[i] = dMu - 2.f * my * dSy - mx * dSxy;
+    m2[i] = dSy;
+    m3[i] = dSxy;
+}
+
+__global__ void fused_ssim_pointwise_bwd_pre_kernel(
+    const int n,
+    const int pixels,
+    const float* __restrict__ g,
+    const float* __restrict__ m1,
+    const float* __restrict__ m2,
+    const float* __restrict__ m3,
+    float* __restrict__ stacked
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float gi = g[i % pixels];
+    stacked[i] = gi * m1[i];
+    stacked[n + i] = gi * m2[i];
+    stacked[2 * n + i] = gi * m3[i];
+}
+
+__global__ void fused_ssim_pointwise_bwd_post_kernel(
+    const int n,
+    const float* __restrict__ b1,
+    const float* __restrict__ b2,
+    const float* __restrict__ b3,
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    float* __restrict__ gradY
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    gradY[i] = b1[i] + 2.f * y[i] * b2[i] + x[i] * b3[i];
+}
+
+torch::Tensor fused_ssim_stack_tensor(
+    const torch::Tensor &x,
+    const torch::Tensor &y
+){
+    const int n = x.numel();
+    torch::Tensor stacked = torch::empty({5 * x.size(0), x.size(1), x.size(2), x.size(3)}, x.options());
+    fused_ssim_stack_kernel<<<(n + 255) / 256, 256>>>(
+        n, x.data_ptr<float>(), y.data_ptr<float>(), stacked.data_ptr<float>()
+    );
+    return stacked;
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+fused_ssim_pointwise_fwd_tensor(
+    const torch::Tensor &muX,
+    const torch::Tensor &muY,
+    const torch::Tensor &blurY2,
+    const torch::Tensor &blurXY,
+    const torch::Tensor &sigmaX
+){
+    const int n = muX.numel();
+    torch::Tensor S = torch::empty_like(muX);
+    torch::Tensor m1 = torch::empty_like(muX);
+    torch::Tensor m2 = torch::empty_like(muX);
+    torch::Tensor m3 = torch::empty_like(muX);
+    fused_ssim_pointwise_fwd_kernel<<<(n + 255) / 256, 256>>>(
+        n,
+        muX.data_ptr<float>(), muY.data_ptr<float>(),
+        blurY2.data_ptr<float>(), blurXY.data_ptr<float>(),
+        sigmaX.data_ptr<float>(),
+        S.data_ptr<float>(), m1.data_ptr<float>(), m2.data_ptr<float>(), m3.data_ptr<float>()
+    );
+    return std::make_tuple(S, m1, m2, m3);
+}
+
+torch::Tensor fused_ssim_pointwise_bwd_pre_tensor(
+    const torch::Tensor &g,
+    const torch::Tensor &m1,
+    const torch::Tensor &m2,
+    const torch::Tensor &m3
+){
+    const int n = m1.numel();
+    const int pixels = g.numel();
+    torch::Tensor stacked = torch::empty({3 * m1.size(0), m1.size(1), m1.size(2), m1.size(3)}, m1.options());
+    fused_ssim_pointwise_bwd_pre_kernel<<<(n + 255) / 256, 256>>>(
+        n, pixels,
+        g.data_ptr<float>(),
+        m1.data_ptr<float>(), m2.data_ptr<float>(), m3.data_ptr<float>(),
+        stacked.data_ptr<float>()
+    );
+    return stacked;
+}
+
+torch::Tensor fused_ssim_pointwise_bwd_post_tensor(
+    const torch::Tensor &b1,
+    const torch::Tensor &b2,
+    const torch::Tensor &b3,
+    const torch::Tensor &x,
+    const torch::Tensor &y
+){
+    const int n = x.numel();
+    torch::Tensor gradY = torch::empty_like(x);
+    fused_ssim_pointwise_bwd_post_kernel<<<(n + 255) / 256, 256>>>(
+        n,
+        b1.data_ptr<float>(), b2.data_ptr<float>(), b3.data_ptr<float>(),
+        x.data_ptr<float>(), y.data_ptr<float>(),
+        gradY.data_ptr<float>()
+    );
+    return gradY;
+}
+
 __global__ void compute_cov2d_bounds_kernel(
     const unsigned num_pts, const float* __restrict__ covs2d, float* __restrict__ conics, float* __restrict__ radii
 ) {
@@ -579,7 +734,11 @@ std::
         const torch::Tensor &final_Ts,
         const torch::Tensor &final_idx,
         const torch::Tensor &v_output, // dL_dout_color
-        const torch::Tensor &v_output_alpha // dL_dout_alpha
+        const torch::Tensor &v_output_alpha, // dL_dout_alpha
+        const torch::Tensor &error_map, // [H,W] or empty
+        const torch::Tensor &edge_map, // [H,W] or empty
+        const torch::Tensor &densification_info, // [4,N] accumulated in place, or empty
+        const torch::Tensor &v_xy_abs // [N,2] accumulated in place, or empty
     ) {
 
     CHECK_INPUT(xys);
@@ -594,6 +753,25 @@ std::
     }
 
     const int num_points = xys.size(0);
+
+    if (densification_info.numel() > 0){
+        CHECK_INPUT(densification_info);
+        if (densification_info.size(0) != 4 || densification_info.size(1) != num_points){
+            AT_ERROR("densification_info must have dimensions (4, num_points)");
+        }
+    }
+    if (v_xy_abs.numel() > 0){
+        CHECK_INPUT(v_xy_abs);
+        if (v_xy_abs.size(0) != num_points || v_xy_abs.size(1) != 2){
+            AT_ERROR("v_xy_abs must have dimensions (num_points, 2)");
+        }
+    }
+    if (error_map.numel() > 0){
+        CHECK_INPUT(error_map);
+        if (error_map.numel() != img_height * img_width){
+            AT_ERROR("error_map must have img_height * img_width elements");
+        }
+    }
     const dim3 tile_bounds = {
         (img_width + BLOCK_X - 1) / BLOCK_X,
         (img_height + BLOCK_Y - 1) / BLOCK_Y,
@@ -612,6 +790,7 @@ std::
     rasterize_backward_kernel<<<tile_bounds, block>>>(
         tile_bounds,
         img_size,
+        num_points,
         gaussians_ids_sorted.contiguous().data_ptr<int>(),
         (int2 *)tile_bins.contiguous().data_ptr<int>(),
         (float2 *)xys.contiguous().data_ptr<float>(),
@@ -623,10 +802,14 @@ std::
         final_idx.contiguous().data_ptr<int>(),
         (float3 *)v_output.contiguous().data_ptr<float>(),
         v_output_alpha.contiguous().data_ptr<float>(),
+        error_map.numel() > 0 ? error_map.data_ptr<float>() : nullptr,
+        edge_map.numel() > 0 ? edge_map.data_ptr<float>() : nullptr,
         (float2 *)v_xy.contiguous().data_ptr<float>(),
+        v_xy_abs.numel() > 0 ? (float2 *)v_xy_abs.data_ptr<float>() : nullptr,
         (float3 *)v_conic.contiguous().data_ptr<float>(),
         (float3 *)v_colors.contiguous().data_ptr<float>(),
-        v_opacity.contiguous().data_ptr<float>()
+        v_opacity.contiguous().data_ptr<float>(),
+        densification_info.numel() > 0 ? densification_info.data_ptr<float>() : nullptr
     );
 
     return std::make_tuple(v_xy, v_conic, v_colors, v_opacity);

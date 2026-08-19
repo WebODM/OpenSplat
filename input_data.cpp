@@ -1,8 +1,18 @@
 #include <filesystem>
 #include <mutex>
+#include <atomic>
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#elif defined(USE_HIP)
+#include <hip/hip_runtime_api.h>
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <nlohmann/json.hpp>
 #include "input_data.hpp"
 #include "cv_utils.hpp"
+#include "undistort.hpp"
 
 namespace fs = std::filesystem;
 using namespace torch::indexing;
@@ -51,9 +61,15 @@ void Camera::loadImage(float downscaleFactor){
     }
     
     cv::Mat cImg = imreadRGB(filePath);
-    
+
+    cv::Mat cMask;
+    if (!maskPath.empty()){
+        cMask = cv::imread(maskPath, cv::IMREAD_GRAYSCALE);
+        if (cMask.empty()) throw std::runtime_error("Cannot read mask " + maskPath);
+    }
+
     float rescaleF = 1.0f;
-    // If camera intrinsics don't match the image dimensions 
+    // If camera intrinsics don't match the image dimensions
     if (cImg.rows != height || cImg.cols != width){
         rescaleF = static_cast<float>(cImg.rows) / static_cast<float>(height);
     }
@@ -71,35 +87,43 @@ void Camera::loadImage(float downscaleFactor){
         cy *= scaleFactor;
     }
 
-    K = getIntrinsicsMatrix();
-    cv::Rect roi;
+    if (!cMask.empty()){
+        cv::threshold(cMask, cMask, 127, 255, cv::THRESH_BINARY);
+        if (cMask.rows != cImg.rows || cMask.cols != cImg.cols){
+            cv::resize(cMask, cMask, cv::Size(cImg.cols, cImg.rows), 0.0, 0.0, cv::INTER_LINEAR);
+        }
+    }
 
     if (hasDistortionParameters()){
-        // Undistort
-        std::vector<float> distCoeffs = undistortionParameters();
-        cv::Mat cK = floatNxNtensorToMat(K);
-        cv::Mat newK = cv::getOptimalNewCameraMatrix(cK, distCoeffs, cv::Size(cImg.cols, cImg.rows), 0, cv::Size(), &roi);
-
-        cv::Mat undistorted = cv::Mat::zeros(cImg.rows, cImg.cols, cImg.type());
-        cv::undistort(cImg, undistorted, cK, distCoeffs, newK);
-        
+        UndistortParams p = computeUndistortParams(fx, fy, cx, cy, cImg.cols, cImg.rows,
+                                                   k1, k2, k3, k4, k5, k6, p1, p2);
+        cv::Mat mapx, mapy;
+        buildUndistortMaps(p, mapx, mapy);
+        cv::Mat undistorted;
+        cv::remap(cImg, undistorted, mapx, mapy, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
         image = imageToTensor(undistorted);
-        K = floatNxNMatToTensor(newK);
+        if (!cMask.empty()){
+            cv::Mat remapped;
+            cv::remap(cMask, remapped, mapx, mapy, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
+            cMask = remapped;
+        }
+        fx = p.dstFx;
+        fy = p.dstFy;
+        cx = p.dstCx;
+        cy = p.dstCy;
     }else{
-        roi = cv::Rect(0, 0, cImg.cols, cImg.rows);
         image = imageToTensor(cImg);
     }
 
-    // Crop to ROI
-    image = image.index({Slice(roi.y, roi.y + roi.height), Slice(roi.x, roi.x + roi.width), Slice()});
-
-    // Update parameters
     height = image.size(0);
     width = image.size(1);
-    fx = K[0][0].item<float>();
-    fy = K[1][1].item<float>();
-    cx = K[0][2].item<float>();
-    cy = K[1][2].item<float>();
+    K = getIntrinsicsMatrix();
+
+    if (!cMask.empty()){
+        torch::Tensor m = torch::from_blob(cMask.data, {cMask.rows, cMask.cols}, torch::kU8)
+                            .to(torch::kFloat32).div(255.0f).clone();
+        mask = (m >= 0.5f).to(torch::kFloat32);
+    }
 }
 
 torch::Tensor Camera::getImage(int downscaleFactor){
@@ -126,9 +150,112 @@ bool Camera::hasDistortionParameters(){
     return k1 != 0.0f || k2 != 0.0f || k3 != 0.0f || k4 != 0.0f || k5 != 0.0f || k6 != 0.0f || p1 != 0.0f || p2 != 0.0f;
 }
 
-std::vector<float> Camera::undistortionParameters(){
-    std::vector<float> p = { k1, k2, p1, p2, k3, k4, k5, k6 };
-    return p;
+torch::Tensor Camera::getMask(int downscaleFactor){
+    if (!hasMask()) return mask;
+    if (downscaleFactor <= 1) return mask;
+    if (maskPyramids.find(downscaleFactor) != maskPyramids.end()){
+        return maskPyramids[downscaleFactor];
+    }
+    torch::Tensor m = mask.unsqueeze(0).unsqueeze(0);
+    m = torch::nn::functional::interpolate(m,
+            torch::nn::functional::InterpolateFuncOptions()
+                .size(std::vector<int64_t>{ mask.size(0) / downscaleFactor, mask.size(1) / downscaleFactor })
+                .mode(torch::kBilinear).align_corners(false));
+    m = (m.squeeze(0).squeeze(0) >= 0.5f).to(torch::kFloat32);
+    maskPyramids[downscaleFactor] = m;
+    return m;
+}
+
+bool Camera::gpuCacheEnabled = true;
+
+// Half the free VRAM at first use (CUDA/HIP), a quarter of system RAM on
+// Apple unified memory, 1GB otherwise
+static long long gpuCacheBudget(){
+#ifdef USE_CUDA
+    size_t freeB = 0, totalB = 0;
+    if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess){
+        return static_cast<long long>(freeB / 2);
+    }
+#elif defined(USE_HIP)
+    size_t freeB = 0, totalB = 0;
+    if (hipMemGetInfo(&freeB, &totalB) == hipSuccess){
+        return static_cast<long long>(freeB / 2);
+    }
+#endif
+#ifdef __APPLE__
+    int64_t ram = 0;
+    size_t size = sizeof(ram);
+    if (sysctlbyname("hw.memsize", &ram, &size, nullptr, 0) == 0){
+        return ram / 4;
+    }
+#endif
+    return 1LL << 30;
+}
+
+// Cache device-side tensors per camera to avoid re-uploading every iteration
+static torch::Tensor gpuCached(std::unordered_map<int, torch::Tensor> &cache, int key,
+                               const torch::Tensor &src, const torch::Device &device){
+    if (device == torch::kCPU || !Camera::gpuCacheEnabled) return src.to(device);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    static std::atomic<long long> gpuCacheBytes{0};
+    static const long long budget = gpuCacheBudget();
+    long long bytes = src.numel() * src.element_size();
+    if (gpuCacheBytes.load() + bytes > budget) return src.to(device);
+    gpuCacheBytes += bytes;
+    torch::Tensor t = src.to(device);
+    cache[key] = t;
+    return t;
+}
+
+torch::Tensor Camera::getImageGpu(int downscaleFactor, const torch::Device &device){
+    return gpuCached(gpuImageCache, downscaleFactor, getImage(downscaleFactor), device);
+}
+
+torch::Tensor Camera::getMaskGpu(int downscaleFactor, const torch::Device &device){
+    torch::Tensor m = getMask(downscaleFactor);
+    if (!m.defined() || m.numel() == 0) return m;
+    return gpuCached(gpuMaskCache, downscaleFactor, m, device);
+}
+
+torch::Tensor Camera::getEdgeMapGpu(int downscaleFactor, const torch::Device &device){
+    return gpuCached(gpuEdgeCache, downscaleFactor, getEdgeMap(downscaleFactor).contiguous(), device);
+}
+
+torch::Tensor Camera::getEdgeMap(int downscaleFactor){
+    if (edgePyramids.find(downscaleFactor) != edgePyramids.end()){
+        return edgePyramids[downscaleFactor];
+    }
+    cv::Mat cImg = tensorToImage(getImage(downscaleFactor));
+    cv::Mat gray, edges;
+    cv::cvtColor(cImg, gray, cv::COLOR_RGB2GRAY);
+    cv::Canny(gray, edges, 50, 150);
+    torch::Tensor e = torch::from_blob(edges.data, {edges.rows, edges.cols}, torch::kU8)
+                        .to(torch::kFloat32).div(255.0f).clone();
+    edgePyramids[downscaleFactor] = e;
+    return e;
+}
+
+std::string findMaskPath(const std::string &imagePath, const std::string &projectRoot){
+    static const char *folders[] = { "masks", "mask", "segmentation", "dynamic_masks" };
+    static const char *extensions[] = { ".png", ".jpg", ".jpeg", ".mask.png" };
+
+    fs::path img(imagePath);
+    std::string stem = img.stem().string();
+    std::string name = img.filename().string();
+
+    for (const char *folder : folders){
+        fs::path dir = fs::path(projectRoot) / folder;
+        if (!fs::exists(dir) || !fs::is_directory(dir)) continue;
+        for (const char *ext : extensions){
+            fs::path cand = dir / (stem + ext);
+            if (fs::exists(cand)) return cand.string();
+            cand = dir / (name + ext);
+            if (fs::exists(cand)) return cand.string();
+        }
+    }
+    return "";
 }
 
 std::tuple<std::vector<Camera>, Camera *> InputData::getCameras(bool validate, const std::string &valImage){

@@ -1,4 +1,4 @@
-#ifdef USE_HIP
+﻿#ifdef USE_HIP
 #include <hip/hip_runtime.h>
 #else
 #include "cuda_runtime.h"
@@ -22,6 +22,31 @@ std::tuple<
     torch::Tensor, // output conics
     torch::Tensor> // output radii
 compute_cov2d_bounds_tensor(const int num_pts, torch::Tensor &A);
+
+torch::Tensor fused_ssim_stack_tensor(
+    const torch::Tensor &x,
+    const torch::Tensor &y);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+fused_ssim_pointwise_fwd_tensor(
+    const torch::Tensor &muX,
+    const torch::Tensor &muY,
+    const torch::Tensor &blurY2,
+    const torch::Tensor &blurXY,
+    const torch::Tensor &sigmaX);
+
+torch::Tensor fused_ssim_pointwise_bwd_pre_tensor(
+    const torch::Tensor &g,
+    const torch::Tensor &m1,
+    const torch::Tensor &m2,
+    const torch::Tensor &m3);
+
+torch::Tensor fused_ssim_pointwise_bwd_post_tensor(
+    const torch::Tensor &b1,
+    const torch::Tensor &b2,
+    const torch::Tensor &b3,
+    const torch::Tensor &x,
+    const torch::Tensor &y);
 
 torch::Tensor compute_sh_forward_tensor(
     unsigned num_points,
@@ -186,5 +211,9 @@ std::
         const torch::Tensor &final_Ts,
         const torch::Tensor &final_idx,
         const torch::Tensor &v_output, // dL_dout_color
-        const torch::Tensor &v_output_alpha
+        const torch::Tensor &v_output_alpha,
+        const torch::Tensor &error_map, // [H,W] or empty
+        const torch::Tensor &edge_map, // [H,W] or empty
+        const torch::Tensor &densification_info, // [4,N] accumulated in place, or empty
+        const torch::Tensor &v_xy_abs // [N,2] accumulated in place, or empty
     );

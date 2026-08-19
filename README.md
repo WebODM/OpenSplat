@@ -11,8 +11,6 @@ Graphics card recommended, but not required! OpenSplat runs the fastest on NVIDI
 
 Commercial use allowed and encouraged under the terms of the [AGPLv3](https://www.tldrlegal.com/license/gnu-affero-general-public-license-v3-agpl-3-0). ✅
 
-We even have a [song](https://youtu.be/1bma7XJkoDM) 🎵
-
 ## Getting Started
 
 If you're on Windows, you can [buy](http://sites.fastspring.com/masseranolabs/product/opensplatforwindows) the pre-built program. This saves you time and helps support the project ❤️. Then jump directly to the [run](#run) section. As an alternative, check the [build](#build) section below.
@@ -125,6 +123,7 @@ You will also need to install Xcode and the Xcode command line tools to compile 
 1. Install Xcode from the Apple App Store.
 2. Install the command line tools with `xcode-select --install`. This might do nothing on your machine.
 3. If `xcode-select --print-path` prints `/Library/Developer/CommandLineTools`,then run `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`.
+4. On recent Xcode versions the Metal toolchain is a separate download. If `xcrun -sdk macosx metal --version` fails, run `xcodebuild -downloadComponent MetalToolchain`.
 
 Then run:
 
@@ -132,11 +131,11 @@ Then run:
 git clone https://github.com/pierotofy/OpenSplat OpenSplat
 cd OpenSplat
 mkdir build && cd build
-cmake -DCMAKE_PREFIX_PATH=/path/to/libtorch/ -DGPU_RUNTIME=MPS .. && make -j$(sysctl -n hw.logicalcpu)
+cmake -DCMAKE_PREFIX_PATH=/path/to/libtorch/ .. && make -j$(sysctl -n hw.logicalcpu)
 ./opensplat
 ```
 
-If building CPU-only, remove `-DGPU_RUNTIME=MPS`.
+On macOS `GPU_RUNTIME` defaults to `MPS` (metal acceleration). If the Metal compiler isn't available, the build automatically falls back to CPU. To force a CPU-only build, pass `-DGPU_RUNTIME=CPU`.
 
 :warning: You will probably get a *libc10.dylib can’t be opened because Apple cannot check it for malicious software* error on first run. Open **System Settings** and go to **Privacy & Security** and find the **Allow** button. You might need to repeat this several times until all torch libraries are loaded.
 

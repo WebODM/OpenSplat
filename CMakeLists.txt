@@ -2,7 +2,12 @@ cmake_minimum_required(VERSION 3.21)
 project(opensplat)
 
 set(OPENSPLAT_BUILD_SIMPLE_TRAINER OFF CACHE BOOL "Build simple trainer applications")
-set(GPU_RUNTIME "CUDA" CACHE STRING "HIP or CUDA or MPS")
+if(APPLE)
+    set(GPU_RUNTIME_DEFAULT "MPS")
+else()
+    set(GPU_RUNTIME_DEFAULT "CUDA")
+endif()
+set(GPU_RUNTIME "${GPU_RUNTIME_DEFAULT}" CACHE STRING "HIP or CUDA or MPS or CPU")
 set(OPENCV_DIR "OPENCV_DIR-NOTFOUND" CACHE PATH "Path to the OPENCV installation directory")
 set(OPENSPLAT_MAX_CUDA_COMPATIBILITY OFF CACHE BOOL "Build for maximum CUDA device compatibility")
 set(OPENSPLAT_BUILD_VISUALIZER OFF CACHE BOOL "Build visualizer application")
@@ -13,6 +18,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # Read version
 file(READ "VERSION" APP_VERSION)
+string(STRIP "${APP_VERSION}" APP_VERSION)
 
 # Read git commit
 set(GIT_REV "")
@@ -146,18 +152,28 @@ elseif(GPU_RUNTIME STREQUAL "HIP")
     endif()
     list(APPEND CMAKE_PREFIX_PATH "${ROCM_ROOT}")
 elseif(GPU_RUNTIME STREQUAL "MPS")
-    find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
-    find_library(METAL_FRAMEWORK    Metal      REQUIRED)
-    find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
-    message(STATUS "Metal framework found")
+    execute_process(COMMAND xcrun -sdk macosx metal --version
+                    RESULT_VARIABLE METAL_COMPILER_RESULT
+                    OUTPUT_QUIET ERROR_QUIET)
+    if(NOT METAL_COMPILER_RESULT EQUAL 0)
+        message(WARNING "Metal compiler not found, building with CPU support only. "
+                        "Install Xcode and the Metal toolchain "
+                        "(xcodebuild -downloadComponent MetalToolchain), then re-run cmake.")
+        set(GPU_RUNTIME "CPU")
+    else()
+        find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
+        find_library(METAL_FRAMEWORK    Metal      REQUIRED)
+        find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
+        message(STATUS "Metal framework found")
 
-    set(XC_FLAGS -O3)
-    if(OPENSPLAT_USE_FAST_MATH)
-        message(STATUS "Fast math optimizations enabled for Metal")
-        
-        set(XC_FLAGS ${XC_FLAGS} -ffast-math)
+        set(XC_FLAGS -O3)
+        if(OPENSPLAT_USE_FAST_MATH)
+            message(STATUS "Fast math optimizations enabled for Metal")
+
+            set(XC_FLAGS ${XC_FLAGS} -ffast-math)
+        endif()
+        set(USE_MPS ON CACHE BOOL "Use MPS for GPU acceleration")
     endif()
-    set(USE_MPS ON CACHE BOOL "Use MPS for GPU acceleration")
 else()
     set(GPU_RUNTIME "CPU")
 endif()
@@ -247,9 +263,9 @@ add_library(gsplat_cpu rasterizer/gsplat-cpu/gsplat_cpu.cpp)
 target_include_directories(gsplat_cpu PRIVATE ${TORCH_INCLUDE_DIRS})
 
 set(OPENSPLAT_SRC_FILES opensplat.cpp point_io.cpp nerfstudio.cpp model.cpp
-kdtree_tensor.cpp spherical_harmonics.cpp cv_utils.cpp utils.cpp project_gaussians.cpp
-rasterize_gaussians.cpp ssim.cpp optim_scheduler.cpp colmap.cpp opensfm.cpp openmvg.cpp input_data.cpp
-tensor_math.cpp rad.cpp zip_utils.cpp)
+kdtree_tensor.cpp spherical_harmonics.cpp cv_utils.cpp project_gaussians.cpp
+rasterize_gaussians.cpp ssim.cpp colmap.cpp opensfm.cpp openmvg.cpp input_data.cpp
+tensor_math.cpp rad.cpp zip_utils.cpp undistort.cpp)
 
 if (OPENSPLAT_BUILD_VISUALIZER)
     if (Pangolin_FOUND)

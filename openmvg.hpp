@@ -43,7 +43,7 @@ namespace omvg{
       // image size
       uint32_t ui_width, ui_height;
     };
-    bool read_views(const json& data, std::unordered_map<uint32_t, Intrinsic> &views);
+    bool read_views(const json& data, std::unordered_map<uint32_t, View> &views);
 
     
     struct Pose{
@@ -51,32 +51,6 @@ namespace omvg{
         std::vector<float> center;
     };
     bool read_poses(const json& data, std::unordered_map<uint32_t, Pose> &poses);
-
-    /*
-    struct Landmark{
-        uint32_t id_view;
-        Eigen::Vector3d location_3d;
-    }
-
-    struct Observation{
-        uint32_t id_feat;
-        // two location in the image
-        Eigen::Vector2d x;
-    }
-    */
-
-
-    //std::unordered_map<Key, Value>;
-
-
-/*
-    struct Pose{
-        std::vector<float> rotation = {0.0f, 0.0f, 0.0f};
-        std::vector<float> translation = {0.0f, 0.0f, 0.0f};
-        std::string camera = "";
-    };
-    void from_json(const json& j, Shot &s);
-*/
 
     InputData inputDataFromOpenMVG(const std::string &projectRoot);
 }   

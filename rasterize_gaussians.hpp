@@ -1,4 +1,4 @@
-#ifndef RASTERIZE_GAUSSIANS_H
+﻿#ifndef RASTERIZE_GAUSSIANS_H
 #define RASTERIZE_GAUSSIANS_H
 
 #include <torch/torch.h>
@@ -22,7 +22,7 @@ std::tuple<torch::Tensor,
 
 class RasterizeGaussians : public Function<RasterizeGaussians>{
 public:
-    static torch::Tensor forward(AutogradContext *ctx, 
+    static variable_list forward(AutogradContext *ctx,
             torch::Tensor xys,
             torch::Tensor depths,
             torch::Tensor radii,
@@ -32,7 +32,11 @@ public:
             torch::Tensor opacity,
             int imgHeight,
             int imgWidth,
-            torch::Tensor background);
+            torch::Tensor background,
+            torch::Tensor errorMap = torch::Tensor(),
+            torch::Tensor edgeMap = torch::Tensor(),
+            torch::Tensor densificationInfo = torch::Tensor(),
+            torch::Tensor xyAbsGrad = torch::Tensor());
     static tensor_list backward(AutogradContext *ctx, tensor_list grad_outputs);
 };
 
@@ -40,7 +44,7 @@ public:
 
 class RasterizeGaussiansCPU : public Function<RasterizeGaussiansCPU>{
 public:
-    static torch::Tensor forward(AutogradContext *ctx, 
+    static variable_list forward(AutogradContext *ctx,
             torch::Tensor xys,
             torch::Tensor radii,
             torch::Tensor conics,
@@ -50,7 +54,11 @@ public:
             torch::Tensor camDepths,
             int imgHeight,
             int imgWidth,
-            torch::Tensor background);
+            torch::Tensor background,
+            torch::Tensor errorMap = torch::Tensor(),
+            torch::Tensor edgeMap = torch::Tensor(),
+            torch::Tensor densificationInfo = torch::Tensor(),
+            torch::Tensor xyAbsGrad = torch::Tensor());
     static tensor_list backward(AutogradContext *ctx, tensor_list grad_outputs);
 };
 
