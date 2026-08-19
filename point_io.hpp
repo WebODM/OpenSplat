@@ -14,12 +14,6 @@
 
 #include <nanoflann.hpp>
 
-struct XYZ {
-    float x;
-    float y;
-    float z;
-};
-
 #define KDTREE_MAX_LEAF 10
 
 #define RELEASE_POINTSET(__POINTER) { if (__POINTER != nullptr) { __POINTER->freeIndex<KdTree>(); delete __POINTER; __POINTER = nullptr; } }
@@ -59,17 +53,6 @@ struct PointSet {
         return false;
     }
 
-    void appendPoint(PointSet &src, size_t idx) {
-        points.push_back(src.points[idx]);
-        colors.push_back(src.colors[idx]);
-    }
-
-    bool hasNormals() const { return normals.size() > 0; }
-    bool hasColors() const { return colors.size() > 0; }
-    bool hasViews() const { return views.size() > 0; }
-
-    double spacing(int kNeighbors = 3);
-
     template <typename T>
     void freeIndex() {
         if (kdTree != nullptr) {
@@ -89,8 +72,6 @@ struct PointSet {
 
     ~PointSet() {
     }
-private:
-    double m_spacing = -1.0;
 };
 
 using KdTree = nanoflann::KDTreeSingleIndexAdaptor<
@@ -114,12 +95,6 @@ PointSet *fastPlyReadPointSet(const std::string &filename);
 PointSet *pdalReadPointSet(const std::string &filename);
 PointSet *colmapReadPointSet(const std::string &filename);
 PointSet *readPointSet(const std::string &filename);
-
-void fastPlySavePointSet(PointSet &pSet, const std::string &filename);
-void pdalSavePointSet(PointSet &pSet, const std::string &filename);
-void savePointSet(PointSet &pSet, const std::string &filename);
-
-bool fileExists(const std::string &path);
 
 
 #endif

@@ -26,50 +26,10 @@
 
 namespace fs = std::filesystem;
 
-torch::Tensor randomQuatTensor(long long n){
-    torch::Tensor u = torch::rand(n);
-    torch::Tensor v = torch::rand(n);
-    torch::Tensor w = torch::rand(n);
-    return torch::stack({
-        torch::sqrt(1 - u) * torch::sin(2 * PI * v),
-        torch::sqrt(1 - u) * torch::cos(2 * PI * v),
-        torch::sqrt(u) * torch::sin(2 * PI * w),
-        torch::sqrt(u) * torch::cos(2 * PI * w)
-    }, -1);
-}
-
 torch::Tensor identityQuatTensor(long long n){
     torch::Tensor q = torch::zeros({n, 4});
     q.index_put_({Slice(), 0}, 1.0f);
     return q;
-}
-
-torch::Tensor mrnfKnnLogScales(const torch::Tensor &xyz){
-    long long n = xyz.size(0);
-    torch::Tensor lo = std::get<0>(xyz.kthvalue((std::max)(static_cast<long long>(1), static_cast<long long>(0.125 * n)), 0));
-    torch::Tensor hi = std::get<0>(xyz.kthvalue((std::min)(n, static_cast<long long>(0.875 * n) + 1), 0));
-    torch::Tensor extents = (hi - lo) / 2.0f;
-    float medianSize = (std::max)(2.0f * extents.median().item<float>(), 0.01f);
-    float maxScale = 0.1f * medianSize;
-
-    PointsTensor pt(xyz);
-    KdTreeTensor *index = pt.getIndex<KdTreeTensor>();
-    torch::Tensor dists = torch::zeros({n, 1}, torch::kFloat32);
-    auto acc = xyz.accessor<float, 2>();
-    auto dAcc = dists.accessor<float, 2>();
-    for (long long i = 0; i < n; i++){
-        float query[3] = { acc[i][0], acc[i][1], acc[i][2] };
-        size_t retIndex[3];
-        float sqDist[3];
-        nanoflann::KNNResultSet<float, size_t> resultSet(3);
-        resultSet.init(retIndex, sqDist);
-        index->findNeighbors(resultSet, query);
-        // Skip self (distance 0), average the next two
-        float d = (std::sqrt(sqDist[1]) + std::sqrt(sqDist[2])) * 0.25f;
-        dAcc[i][0] = std::clamp(d, 1e-3f, maxScale);
-    }
-    pt.freeIndex<KdTreeTensor>();
-    return dists.log();
 }
 
 torch::Tensor projectionMatrix(float zNear, float zFar, float fovX, float fovY, const torch::Device &device){
@@ -84,15 +44,6 @@ torch::Tensor projectionMatrix(float zNear, float zFar, float fovX, float fovY, 
         {0.0f, 0.0f, (zFar + zNear) / (zFar - zNear), -1.0f * zFar * zNear / (zFar - zNear)},
         {0.0f, 0.0f, 1.0f, 0.0f}
     }, device);
-}
-
-torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt){
-    torch::Tensor mse = (rendered - gt).pow(2).mean();
-    return (10.f * torch::log10(1.0 / mse));
-}
-
-torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt){
-    return torch::abs(gt - rendered).mean();
 }
 
 template<typename T>
@@ -290,24 +241,6 @@ torch::Tensor Model::forward(Camera& cam, int step){
     rgb = torch::clamp_max(rgb, 1.0f);
 
     return rgb;
-}
-
-void Model::optimizersZeroGrad(){
-  meansOpt->zero_grad();
-  scalesOpt->zero_grad();
-  quatsOpt->zero_grad();
-  featuresDcOpt->zero_grad();
-  featuresRestOpt->zero_grad();
-  opacitiesOpt->zero_grad();
-}
-
-void Model::optimizersStep(){
-  meansOpt->step();
-  scalesOpt->step();
-  quatsOpt->step();
-  featuresDcOpt->step();
-  featuresRestOpt->step();
-  opacitiesOpt->step();
 }
 
 static void setOptimizerLr(torch::optim::Adam *opt, double lr){

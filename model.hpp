@@ -9,17 +9,12 @@
 #include "spherical_harmonics.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
-#include "optim_scheduler.hpp"
 
 using namespace torch::indexing;
 using namespace torch::autograd;
 
-torch::Tensor randomQuatTensor(long long n);
 torch::Tensor identityQuatTensor(long long n);
-torch::Tensor mrnfKnnLogScales(const torch::Tensor &xyz);
 torch::Tensor projectionMatrix(float zNear, float zFar, float fovX, float fovY, const torch::Device &device);
-torch::Tensor psnr(const torch::Tensor& rendered, const torch::Tensor& gt);
-torch::Tensor l1(const torch::Tensor& rendered, const torch::Tensor& gt);
 
 struct Model{
   Model(const InputData &inputData, int numCameras,
@@ -80,8 +75,6 @@ struct Model{
   void releaseOptimizers();
 
   torch::Tensor forward(Camera& cam, int step);
-  void optimizersZeroGrad();
-  void optimizersStep();
   void optimizerStepCadence(int step); // FastGS stepping schedule with gradient accumulation
   void schedulersStep(int step);
   int getDownscaleFactor(int step);

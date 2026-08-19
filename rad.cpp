@@ -132,7 +132,6 @@ struct F16 {
 
     F16() = default;
     static F16 fromF32(float v){ F16 h; h.bits = f16FromF32(v); return h; }
-    static F16 fromBits(uint16_t b){ F16 h; h.bits = b; return h; }
     float toF32() const { return f16ToF32(bits); }
     bool isNan() const { return (bits & 0x7C00u) == 0x7C00u && (bits & 0x03FFu) != 0; }
 };
@@ -218,7 +217,6 @@ struct Vec3 {
     float dot(const Vec3 &o) const { return (x * o.x + y * o.y) + z * o.z; }
     float lengthSquared() const { return dot(*this); }
     float length() const { return std::sqrt(dot(*this)); }
-    float distance(const Vec3 &o) const { return (*this - o).length(); }
 
     bool isFinite() const { return std::isfinite(x) && std::isfinite(y) && std::isfinite(z); }
 };
@@ -231,13 +229,6 @@ struct I64Vec3 {
 
     int64_t operator[](int i) const { return i == 0 ? x : (i == 1 ? y : z); }
     bool operator==(const I64Vec3 &o) const { return x == o.x && y == o.y && z == o.z; }
-
-    I64Vec3 minv(const I64Vec3 &o) const {
-        return I64Vec3(std::min(x, o.x), std::min(y, o.y), std::min(z, o.z));
-    }
-    I64Vec3 maxv(const I64Vec3 &o) const {
-        return I64Vec3(std::max(x, o.x), std::max(y, o.y), std::max(z, o.z));
-    }
 };
 
 struct I64Vec3Hash {
@@ -731,7 +722,6 @@ struct GsplatArray {
     size_t len() const { return splats.size(); }
 
     void prepareChildren(){ children.resize(len()); }
-    bool hasChildren() const { return !children.empty(); }
     bool hasLodTree() const { return !children.empty(); }
 
     // gsplat.rs new_merged (step is always 0.0 from bhatt_lod)
@@ -1505,23 +1495,6 @@ std::vector<uint8_t> compressToVec(const std::vector<uint8_t> &data){
 
 // Property encoders (port of rad.rs encode_*). All planar (dimension-major)
 // except oct88r8, which is 3 bytes per splat interleaved.
-
-std::vector<uint8_t> encodeF32(const std::vector<float> &data, size_t dims, size_t count){
-    std::vector<uint8_t> result;
-    result.reserve(4 * dims * count);
-    for (size_t d = 0; d < dims; d++){
-        size_t index = d;
-        for (size_t i = 0; i < count; i++){
-            uint32_t bits = f32Bits(data[index]);
-            result.push_back(static_cast<uint8_t>(bits));
-            result.push_back(static_cast<uint8_t>(bits >> 8));
-            result.push_back(static_cast<uint8_t>(bits >> 16));
-            result.push_back(static_cast<uint8_t>(bits >> 24));
-            index += dims;
-        }
-    }
-    return result;
-}
 
 std::vector<uint8_t> encodeF16Prop(const std::vector<float> &data, size_t dims, size_t count){
     std::vector<uint8_t> result;
