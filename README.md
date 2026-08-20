@@ -250,6 +250,10 @@ You can exclude parts of your images by adding 2D masks. Place them in a `masks`
 
 When masks are found they are applied automatically. Use `--no-masks` to ignore them.
 
+### Coordinate Reference System
+
+By default OpenSplat preserves the input coordinate reference system of the model. If you want to automatically center the result so that it displays nicely in most viewers, use `--center`.
+
 ### AMD GPU Notes
 
 To train a model with AMD GPU using docker container, you can use the following command as a reference:
