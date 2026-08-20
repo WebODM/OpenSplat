@@ -76,6 +76,27 @@ std::
         const torch::Tensor &v_xy_abs
     );
 
+// Fused L1 + DSSIM loss over [H,W,C] float images (same contract as
+// the GPU backends): stats[0] = loss, stats[1] = normalization denominator;
+// partials holds the SSIM derivative maps (empty when want_grad is false).
+std::tuple<torch::Tensor, torch::Tensor> fused_loss_forward_tensor_cpu(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask, // [H,W] float or empty
+    const float ssim_weight,
+    const bool valid_padding,
+    const bool want_grad);
+
+torch::Tensor fused_loss_backward_tensor_cpu(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask,
+    const torch::Tensor &partials,
+    const torch::Tensor &stats,
+    const torch::Tensor &v_loss,
+    const float ssim_weight,
+    const bool valid_padding);
+
 int numShBases(int degree);
 
 torch::Tensor compute_sh_forward_tensor_cpu(

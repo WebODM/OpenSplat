@@ -28,7 +28,7 @@ struct Model{
     densificationInterval(densificationInterval), densifyFromIter(densifyFromIter), densifyUntilIter(densifyUntilIter), maxGaussians(maxGaussians),
     lossThresh(lossThresh),
     maxSteps(maxSteps), keepCrs(keepCrs),
-    device(device), ssim(11, 3){
+    device(device){
 
     long long numPoints = inputData.points.xyz.size(0);
     scale = inputData.scale;
@@ -129,7 +129,6 @@ struct Model{
 
   torch::Tensor backgroundColor;
   torch::Device device;
-  SSIM ssim;
 
   int numCameras;
   int numDownscales;
@@ -150,7 +149,6 @@ struct Model{
   float gradAbsThresh = 0.0012f;
   int opacityResetInterval = 3000;
   int numScoreViews = 10;
-  float opacityReg = 0.01f; // global haze/floater penalty on mean opacity
   bool edgeGuidance = true; // Canny-edge weighting of the densification importance
 
   float scale;

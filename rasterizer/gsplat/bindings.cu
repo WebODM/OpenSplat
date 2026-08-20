@@ -8,12 +8,14 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 #include <hip/hip_cooperative_groups.h>
+#include <hip/hip_fp16.h>
 #else
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
 #endif
 
 #include <cstdio>
@@ -23,159 +25,389 @@
 
 namespace cg = cooperative_groups;
 
-// Builds the [5C,1,H,W] blur input (x, y, x*x, y*y, x*y) in a single pass.
-__global__ void fused_ssim_stack_kernel(
-    const int n,
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    float* __restrict__ stacked
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float xi = x[i];
-    const float yi = y[i];
-    stacked[i] = xi;
-    stacked[n + i] = yi;
-    stacked[2 * n + i] = xi * xi;
-    stacked[3 * n + i] = yi * yi;
-    stacked[4 * n + i] = xi * yi;
-}
+// Fused L1 + DSSIM loss over [H,W,C] images. One kernel computes the
+// SSIM map and the closed-form partials in a shared-memory tile (two-pass
+// separable 11-tap blur), one reduces to the scalar loss on-device, and one
+// produces dL/dimage directly.
 
-__global__ void fused_ssim_pointwise_fwd_kernel(
-    const int n,
-    const float* __restrict__ muX,
-    const float* __restrict__ muY,
-    const float* __restrict__ blurY2,
-    const float* __restrict__ blurXY,
-    const float* __restrict__ sigmaX,
-    float* __restrict__ S,
-    float* __restrict__ m1,
-    float* __restrict__ m2,
-    float* __restrict__ m3
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float c1 = 0.0001f;
-    const float c2 = 0.0009f;
-    float mx = muX[i];
-    float my = muY[i];
-    float sy = blurY2[i] - my * my;
-    float sxy = blurXY[i] - mx * my;
-    float A1 = 2.f * mx * my + c1;
-    float A2 = 2.f * sxy + c2;
-    float B1 = mx * mx + my * my + c1;
-    float B2 = sigmaX[i] + sy + c2;
-    float ib = 1.f / (B1 * B2);
-    float s = A1 * A2 * ib;
-    S[i] = s;
-    float dMu = 2.f * A2 * (mx * B1 - my * A1) * ib / B1;
-    float dSy = -s / B2;
-    float dSxy = 2.f * A1 * ib;
-    m1[i] = dMu - 2.f * my * dSy - mx * dSxy;
-    m2[i] = dSy;
-    m3[i] = dSxy;
-}
+#define LOSS_BX 16
+#define LOSS_BY 16
+#define LOSS_HALO 5
+#define LOSS_SX (LOSS_BX + 2 * LOSS_HALO)
+#define LOSS_SY (LOSS_BY + 2 * LOSS_HALO)
+#define LOSS_C1 0.0001f
+#define LOSS_C2 0.0009f
 
-__global__ void fused_ssim_pointwise_bwd_pre_kernel(
-    const int n,
-    const int pixels,
-    const float* __restrict__ g,
-    const float* __restrict__ m1,
-    const float* __restrict__ m2,
-    const float* __restrict__ m3,
-    float* __restrict__ stacked
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float gi = g[i % pixels];
-    stacked[i] = gi * m1[i];
-    stacked[n + i] = gi * m2[i];
-    stacked[2 * n + i] = gi * m3[i];
-}
+// 11-tap gaussian (sigma 1.5), matches the SSIM reference window
+__device__ __constant__ float lossGauss[11] = {
+    0.001028380123898387f, 0.0075987582094967365f, 0.036000773310661316f,
+    0.10936068743467331f, 0.21300552785396576f, 0.26601171493530273f,
+    0.21300552785396576f, 0.10936068743467331f, 0.036000773310661316f,
+    0.0075987582094967365f, 0.001028380123898387f};
 
-__global__ void fused_ssim_pointwise_bwd_post_kernel(
-    const int n,
-    const float* __restrict__ b1,
-    const float* __restrict__ b2,
-    const float* __restrict__ b3,
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    float* __restrict__ gradY
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    gradY[i] = b1[i] + 2.f * y[i] * b2[i] + x[i] * b3[i];
-}
-
-torch::Tensor fused_ssim_stack_tensor(
-    const torch::Tensor &x,
-    const torch::Tensor &y
+__device__ __forceinline__ float loss_pix(
+    const float* __restrict__ img, int y, int x, int c, int H, int W, int C
 ){
-    const int n = x.numel();
-    torch::Tensor stacked = torch::empty({5 * x.size(0), x.size(1), x.size(2), x.size(3)}, x.options());
-    fused_ssim_stack_kernel<<<(n + 255) / 256, 256>>>(
-        n, x.data_ptr<float>(), y.data_ptr<float>(), stacked.data_ptr<float>()
-    );
-    return stacked;
+    if (x < 0 || x >= W || y < 0 || y >= H) return 0.0f;
+    return img[(y * W + x) * C + c];
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-fused_ssim_pointwise_fwd_tensor(
-    const torch::Tensor &muX,
-    const torch::Tensor &muY,
-    const torch::Tensor &blurY2,
-    const torch::Tensor &blurXY,
-    const torch::Tensor &sigmaX
-){
-    const int n = muX.numel();
-    torch::Tensor S = torch::empty_like(muX);
-    torch::Tensor m1 = torch::empty_like(muX);
-    torch::Tensor m2 = torch::empty_like(muX);
-    torch::Tensor m3 = torch::empty_like(muX);
-    fused_ssim_pointwise_fwd_kernel<<<(n + 255) / 256, 256>>>(
-        n,
-        muX.data_ptr<float>(), muY.data_ptr<float>(),
-        blurY2.data_ptr<float>(), blurXY.data_ptr<float>(),
-        sigmaX.data_ptr<float>(),
-        S.data_ptr<float>(), m1.data_ptr<float>(), m2.data_ptr<float>(), m3.data_ptr<float>()
-    );
-    return std::make_tuple(S, m1, m2, m3);
+// A pixel participates in the unmasked loss only away from the blur border
+__device__ __forceinline__ bool loss_valid(int y, int x, int H, int W, bool validPad){
+    if (!validPad || H <= 10 || W <= 10) return true;
+    return x >= LOSS_HALO && x < W - LOSS_HALO && y >= LOSS_HALO && y < H - LOSS_HALO;
 }
 
-torch::Tensor fused_ssim_pointwise_bwd_pre_tensor(
-    const torch::Tensor &g,
-    const torch::Tensor &m1,
-    const torch::Tensor &m2,
-    const torch::Tensor &m3
+__global__ void fused_loss_fwd_kernel(
+    const int H, const int W, const int C,
+    const float* __restrict__ rendered,
+    const float* __restrict__ gt,
+    float* __restrict__ ssimMap, // [H,W] channel mean
+    __half* __restrict__ pMu,    // [H,W,C] each, or nullptr
+    __half* __restrict__ pS1,
+    __half* __restrict__ pS12
 ){
-    const int n = m1.numel();
-    const int pixels = g.numel();
-    torch::Tensor stacked = torch::empty({3 * m1.size(0), m1.size(1), m1.size(2), m1.size(3)}, m1.options());
-    fused_ssim_pointwise_bwd_pre_kernel<<<(n + 255) / 256, 256>>>(
-        n, pixels,
-        g.data_ptr<float>(),
-        m1.data_ptr<float>(), m2.data_ptr<float>(), m3.data_ptr<float>(),
-        stacked.data_ptr<float>()
-    );
-    return stacked;
+    const int px = blockIdx.x * LOSS_BX + threadIdx.x;
+    const int py = blockIdx.y * LOSS_BY + threadIdx.y;
+    const int tileX = blockIdx.x * LOSS_BX;
+    const int tileY = blockIdx.y * LOSS_BY;
+
+    __shared__ float sTile[LOSS_SY][LOSS_SX][2];
+    __shared__ float sConv[LOSS_SY][LOSS_BX][5];
+
+    float ssimSum = 0.0f;
+    for (int c = 0; c < C; c++){
+        // Load tile + halo
+        {
+            const int tileSize = LOSS_SY * LOSS_SX;
+            const int threads = LOSS_BX * LOSS_BY;
+            const int tRank = threadIdx.y * LOSS_BX + threadIdx.x;
+            for (int tid = tRank; tid < tileSize; tid += threads){
+                const int ly = tid / LOSS_SX;
+                const int lx = tid % LOSS_SX;
+                const int gy = tileY + ly - LOSS_HALO;
+                const int gx = tileX + lx - LOSS_HALO;
+                sTile[ly][lx][0] = loss_pix(rendered, gy, gx, c, H, W, C);
+                sTile[ly][lx][1] = loss_pix(gt, gy, gx, c, H, W, C);
+            }
+        }
+        __syncthreads();
+
+        // Horizontal pass: accumulate moments; each thread covers two rows
+        {
+            const int lx = threadIdx.x + LOSS_HALO;
+            for (int pass = 0; pass < 2; pass++){
+                const int ly = threadIdx.y + pass * LOSS_BY;
+                if (ly >= LOSS_SY) break;
+                float sX = 0.f, sX2 = 0.f, sY = 0.f, sY2 = 0.f, sXY = 0.f;
+                #pragma unroll
+                for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                    const float w = lossGauss[LOSS_HALO + d];
+                    const float x = sTile[ly][lx + d][0];
+                    const float y = sTile[ly][lx + d][1];
+                    sX += x * w;
+                    sX2 += x * x * w;
+                    sY += y * w;
+                    sY2 += y * y * w;
+                    sXY += x * y * w;
+                }
+                sConv[ly][threadIdx.x][0] = sX;
+                sConv[ly][threadIdx.x][1] = sX2;
+                sConv[ly][threadIdx.x][2] = sY;
+                sConv[ly][threadIdx.x][3] = sY2;
+                sConv[ly][threadIdx.x][4] = sXY;
+            }
+        }
+        __syncthreads();
+
+        // Vertical pass + SSIM + partials
+        if (px < W && py < H){
+            const int ly = threadIdx.y + LOSS_HALO;
+            const int lx = threadIdx.x;
+            float m0 = 0.f, m1 = 0.f, m2 = 0.f, m3 = 0.f, m4 = 0.f;
+            #pragma unroll
+            for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                const float w = lossGauss[LOSS_HALO + d];
+                const float* row = sConv[ly + d][lx];
+                m0 += row[0] * w;
+                m1 += row[1] * w;
+                m2 += row[2] * w;
+                m3 += row[3] * w;
+                m4 += row[4] * w;
+            }
+            const float muX = m0;
+            const float muY = m2;
+            const float sigmaX = m1 - muX * muX;
+            const float sigmaY = m3 - muY * muY;
+            const float sigmaXY = m4 - muX * muY;
+
+            const float A = muX * muX + muY * muY + LOSS_C1;
+            const float B = sigmaX + sigmaY + LOSS_C2;
+            const float Cc = 2.f * muX * muY + LOSS_C1;
+            const float Dc = 2.f * sigmaXY + LOSS_C2;
+            const float s = (Cc * Dc) / (A * B);
+            ssimSum += s;
+
+            if (pMu){
+                const int idx = (py * W + px) * C + c;
+                const float dMu = (muY * 2.f * Dc) / (A * B) - (muY * 2.f * Cc) / (A * B)
+                                - (muX * 2.f * Cc * Dc) / (A * A * B) + (muX * 2.f * Cc * Dc) / (A * B * B);
+                pMu[idx] = __float2half(dMu);
+                pS1[idx] = __float2half((-Cc * Dc) / (A * B * B));
+                pS12[idx] = __float2half((2.f * Cc) / (A * B));
+            }
+        }
+        __syncthreads();
+    }
+
+    if (px < W && py < H){
+        ssimMap[py * W + px] = ssimSum / static_cast<float>(C);
+    }
 }
 
-torch::Tensor fused_ssim_pointwise_bwd_post_tensor(
-    const torch::Tensor &b1,
-    const torch::Tensor &b2,
-    const torch::Tensor &b3,
-    const torch::Tensor &x,
-    const torch::Tensor &y
+// Reduces the combined loss over pixels: out[0] += sum of gate * ((1-w)*sum_c|d_c| + C*w*(1-ssim)),
+// out[1] += sum of gate. The gate is the mask value or the valid-padding indicator.
+__global__ void fused_loss_reduce_kernel(
+    const int H, const int W, const int C,
+    const float* __restrict__ rendered,
+    const float* __restrict__ gt,
+    const float* __restrict__ ssimMap,
+    const float* __restrict__ mask, // nullptr when unmasked
+    const float ssimWeight,
+    const bool validPad,
+    float* __restrict__ out
 ){
-    const int n = x.numel();
-    torch::Tensor gradY = torch::empty_like(x);
-    fused_ssim_pointwise_bwd_post_kernel<<<(n + 255) / 256, 256>>>(
-        n,
-        b1.data_ptr<float>(), b2.data_ptr<float>(), b3.data_ptr<float>(),
-        x.data_ptr<float>(), y.data_ptr<float>(),
-        gradY.data_ptr<float>()
+    const int numPix = H * W;
+    float lossSum = 0.0f;
+    float gateSum = 0.0f;
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < numPix; p += blockDim.x * gridDim.x){
+        const int y = p / W;
+        const int x = p % W;
+        float gate;
+        if (mask){
+            gate = mask[p];
+        }else{
+            gate = loss_valid(y, x, H, W, validPad) ? 1.0f : 0.0f;
+        }
+        if (gate != 0.0f){
+            float l1 = 0.0f;
+            for (int c = 0; c < C; c++){
+                l1 += fabsf(rendered[p * C + c] - gt[p * C + c]);
+            }
+            const float contrib = (1.0f - ssimWeight) * l1
+                                + static_cast<float>(C) * ssimWeight * (1.0f - ssimMap[p]);
+            lossSum += gate * contrib;
+            gateSum += gate;
+        }
+    }
+
+    __shared__ float sLoss[256];
+    __shared__ float sGate[256];
+    sLoss[threadIdx.x] = lossSum;
+    sGate[threadIdx.x] = gateSum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1){
+        if (threadIdx.x < stride){
+            sLoss[threadIdx.x] += sLoss[threadIdx.x + stride];
+            sGate[threadIdx.x] += sGate[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0){
+        atomicAdd(&out[0], sLoss[0]);
+        atomicAdd(&out[1], sGate[0]);
+    }
+}
+
+// out[0] = loss, out[1] = normalization denominator (gateSum * C)
+__global__ void fused_loss_finalize_kernel(const int C, float* __restrict__ out){
+    const float denom = out[1] * static_cast<float>(C) + 1e-8f;
+    out[0] = out[0] / denom;
+    out[1] = denom;
+}
+
+__global__ void fused_loss_bwd_kernel(
+    const int H, const int W, const int C,
+    const float ssimWeight,
+    const bool validPad,
+    const float* __restrict__ rendered,
+    const float* __restrict__ gt,
+    const float* __restrict__ mask, // nullptr when unmasked
+    const __half* __restrict__ pMu,
+    const __half* __restrict__ pS1,
+    const __half* __restrict__ pS12,
+    const float* __restrict__ stats, // stats[1] = denominator
+    const float* __restrict__ vLoss,
+    float* __restrict__ vRendered
+){
+    const int px = blockIdx.x * LOSS_BX + threadIdx.x;
+    const int py = blockIdx.y * LOSS_BY + threadIdx.y;
+    const int tileX = blockIdx.x * LOSS_BX;
+    const int tileY = blockIdx.y * LOSS_BY;
+    const float chainScale = vLoss[0] / stats[1];
+
+    __shared__ float sData[LOSS_SY][LOSS_SX][3];
+    __shared__ float sConv[LOSS_SY][LOSS_BX][3];
+
+    for (int c = 0; c < C; c++){
+        float p1 = 0.f, p2 = 0.f;
+        if (px < W && py < H){
+            p1 = rendered[(py * W + px) * C + c];
+            p2 = gt[(py * W + px) * C + c];
+        }
+
+        // Load the chain-weighted partials for the tile + halo
+        {
+            const int tileSize = LOSS_SY * LOSS_SX;
+            const int threads = LOSS_BX * LOSS_BY;
+            const int tRank = threadIdx.y * LOSS_BX + threadIdx.x;
+            for (int tid = tRank; tid < tileSize; tid += threads){
+                const int ly = tid / LOSS_SX;
+                const int lx = tid % LOSS_SX;
+                const int gy = tileY + ly - LOSS_HALO;
+                const int gx = tileX + lx - LOSS_HALO;
+                float chain = 0.0f;
+                if (gx >= 0 && gx < W && gy >= 0 && gy < H){
+                    const float gate = mask ? mask[gy * W + gx]
+                                            : (loss_valid(gy, gx, H, W, validPad) ? 1.0f : 0.0f);
+                    chain = -ssimWeight * gate * chainScale;
+                }
+                const int idx = (gy * W + gx) * C + c;
+                const bool inside = gx >= 0 && gx < W && gy >= 0 && gy < H;
+                sData[ly][lx][0] = inside ? __half2float(pMu[idx]) * chain : 0.0f;
+                sData[ly][lx][1] = inside ? __half2float(pS1[idx]) * chain : 0.0f;
+                sData[ly][lx][2] = inside ? __half2float(pS12[idx]) * chain : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Horizontal pass
+        {
+            const int lx = threadIdx.x + LOSS_HALO;
+            for (int pass = 0; pass < 2; pass++){
+                const int ly = threadIdx.y + pass * LOSS_BY;
+                if (ly >= LOSS_SY) break;
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+                #pragma unroll
+                for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                    const float w = lossGauss[LOSS_HALO + d];
+                    a0 += sData[ly][lx + d][0] * w;
+                    a1 += sData[ly][lx + d][1] * w;
+                    a2 += sData[ly][lx + d][2] * w;
+                }
+                sConv[ly][threadIdx.x][0] = a0;
+                sConv[ly][threadIdx.x][1] = a1;
+                sConv[ly][threadIdx.x][2] = a2;
+            }
+        }
+        __syncthreads();
+
+        // Vertical pass + L1 term
+        if (px < W && py < H){
+            const int ly = threadIdx.y + LOSS_HALO;
+            const int lx = threadIdx.x;
+            float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+            #pragma unroll
+            for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                const float w = lossGauss[LOSS_HALO + d];
+                const float* row = sConv[ly + d][lx];
+                s0 += row[0] * w;
+                s1 += row[1] * w;
+                s2 += row[2] * w;
+            }
+            const float gradSsim = s0 + 2.f * p1 * s1 + p2 * s2;
+
+            const float gate = mask ? mask[py * W + px]
+                                    : (loss_valid(py, px, H, W, validPad) ? 1.0f : 0.0f);
+            const float sign = (p1 == p2) ? 0.0f : copysignf(1.0f, p1 - p2);
+            const float gradL1 = (1.0f - ssimWeight) * sign * gate * chainScale;
+
+            vRendered[(py * W + px) * C + c] = gradSsim + gradL1;
+        }
+        __syncthreads();
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_loss_forward_tensor(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask,
+    const float ssim_weight,
+    const bool valid_padding,
+    const bool want_grad
+){
+    CHECK_INPUT(rendered);
+    CHECK_INPUT(gt);
+    const int H = rendered.size(0);
+    const int W = rendered.size(1);
+    const int C = rendered.size(2);
+    const bool hasMask = mask.defined() && mask.numel() > 0;
+    if (hasMask){ CHECK_INPUT(mask); }
+
+    auto opts = rendered.options();
+    torch::Tensor ssimMap = torch::empty({H, W}, opts);
+    torch::Tensor partials = want_grad
+        ? torch::empty({3, static_cast<long long>(H) * W * C}, opts.dtype(torch::kHalf))
+        : torch::empty({0}, opts.dtype(torch::kHalf));
+    __half* pBase = want_grad ? reinterpret_cast<__half*>(partials.data_ptr<at::Half>()) : nullptr;
+    const long long planeSize = static_cast<long long>(H) * W * C;
+
+    const dim3 block(LOSS_BX, LOSS_BY);
+    const dim3 grid((W + LOSS_BX - 1) / LOSS_BX, (H + LOSS_BY - 1) / LOSS_BY);
+    fused_loss_fwd_kernel<<<grid, block>>>(
+        H, W, C,
+        rendered.data_ptr<float>(), gt.data_ptr<float>(),
+        ssimMap.data_ptr<float>(),
+        pBase, pBase ? pBase + planeSize : nullptr, pBase ? pBase + 2 * planeSize : nullptr
     );
-    return gradY;
+
+    torch::Tensor stats = torch::zeros({2}, opts);
+    const int numPix = H * W;
+    const int reduceBlocks = (std::min)(1024, (numPix + 255) / 256);
+    fused_loss_reduce_kernel<<<reduceBlocks, 256>>>(
+        H, W, C,
+        rendered.data_ptr<float>(), gt.data_ptr<float>(),
+        ssimMap.data_ptr<float>(),
+        hasMask ? mask.data_ptr<float>() : nullptr,
+        ssim_weight, valid_padding,
+        stats.data_ptr<float>()
+    );
+    fused_loss_finalize_kernel<<<1, 1>>>(C, stats.data_ptr<float>());
+
+    return std::make_tuple(stats, partials);
+}
+
+torch::Tensor fused_loss_backward_tensor(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask,
+    const torch::Tensor &partials,
+    const torch::Tensor &stats,
+    const torch::Tensor &v_loss,
+    const float ssim_weight,
+    const bool valid_padding
+){
+    const int H = rendered.size(0);
+    const int W = rendered.size(1);
+    const int C = rendered.size(2);
+    const bool hasMask = mask.defined() && mask.numel() > 0;
+
+    torch::Tensor vRendered = torch::empty_like(rendered);
+    const __half* pBase = reinterpret_cast<const __half*>(partials.data_ptr<at::Half>());
+    const long long planeSize = static_cast<long long>(H) * W * C;
+
+    const dim3 block(LOSS_BX, LOSS_BY);
+    const dim3 grid((W + LOSS_BX - 1) / LOSS_BX, (H + LOSS_BY - 1) / LOSS_BY);
+    fused_loss_bwd_kernel<<<grid, block>>>(
+        H, W, C, ssim_weight, valid_padding,
+        rendered.data_ptr<float>(), gt.data_ptr<float>(),
+        hasMask ? mask.data_ptr<float>() : nullptr,
+        pBase, pBase + planeSize, pBase + 2 * planeSize,
+        stats.data_ptr<float>(),
+        v_loss.data_ptr<float>(),
+        vRendered.data_ptr<float>()
+    );
+    return vRendered;
 }
 
 __global__ void compute_cov2d_bounds_kernel(

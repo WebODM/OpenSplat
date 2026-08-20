@@ -589,3 +589,266 @@ torch::Tensor compute_sh_forward_tensor_cpu(
     
     return (result.index({"...", None}) * coeffs).sum(-2);
 }
+
+// Fused L1 + DSSIM loss over [H,W,C] images: same method as the GPU
+// backends (two-pass separable 11-tap blur computing all five moments in one
+// sweep, closed-form SSIM partials saved for a direct backward), parallelized
+// over row bands.
+
+namespace {
+
+const int LOSS_HALO = 5;
+
+// 11-tap gaussian (sigma 1.5), matches the SSIM reference window
+const float lossGauss[11] = {
+    0.001028380123898387f, 0.0075987582094967365f, 0.036000773310661316f,
+    0.10936068743467331f, 0.21300552785396576f, 0.26601171493530273f,
+    0.21300552785396576f, 0.10936068743467331f, 0.036000773310661316f,
+    0.0075987582094967365f, 0.001028380123898387f};
+
+inline bool lossValid(int y, int x, int H, int W, bool validPad){
+    if (!validPad || H <= 10 || W <= 10) return true;
+    return x >= LOSS_HALO && x < W - LOSS_HALO && y >= LOSS_HALO && y < H - LOSS_HALO;
+}
+
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_loss_forward_tensor_cpu(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask,
+    const float ssim_weight,
+    const bool valid_padding,
+    const bool want_grad
+){
+    torch::Tensor r = rendered.contiguous();
+    torch::Tensor g = gt.contiguous();
+    const int H = r.size(0);
+    const int W = r.size(1);
+    const int C = r.size(2);
+    const bool hasMask = mask.defined() && mask.numel() > 0;
+    torch::Tensor m = hasMask ? mask.contiguous() : torch::Tensor();
+
+    const float *rp = r.data_ptr<float>();
+    const float *gp = g.data_ptr<float>();
+    const float *mp = hasMask ? m.data_ptr<float>() : nullptr;
+
+    auto fOpts = r.options();
+    torch::Tensor ssimMap = torch::empty({H, W}, fOpts);
+    torch::Tensor partials = want_grad
+        ? torch::empty({3, static_cast<long long>(H) * W * C}, fOpts.dtype(torch::kHalf))
+        : torch::empty({0}, fOpts.dtype(torch::kHalf));
+    float *sp = ssimMap.data_ptr<float>();
+    at::Half *pBase = want_grad ? partials.data_ptr<at::Half>() : nullptr;
+    const long long planeSize = static_cast<long long>(H) * W * C;
+    at::Half *pMu = pBase;
+    at::Half *pS1 = pBase ? pBase + planeSize : nullptr;
+    at::Half *pS12 = pBase ? pBase + 2 * planeSize : nullptr;
+
+    // Horizontal-moment scratch, reused across channels
+    torch::Tensor hbufT = torch::empty({static_cast<long long>(H) * W * 5}, fOpts);
+    float *hbuf = hbufT.data_ptr<float>();
+
+    const int numWorkers = rasterWorkers(H);
+    const int numBands = (std::min)(H, numWorkers * CHUNKS_PER_WORKER);
+
+    for (int c = 0; c < C; c++){
+        parallelChunks(numBands, numWorkers, [&](int band, int){
+            const int yStart = band * H / numBands;
+            const int yEnd = (band + 1) * H / numBands;
+            for (int y = yStart; y < yEnd; y++){
+                for (int x = 0; x < W; x++){
+                    float sX = 0.f, sX2 = 0.f, sY = 0.f, sY2 = 0.f, sXY = 0.f;
+                    for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                        const int xx = x + d;
+                        if (xx < 0 || xx >= W) continue;
+                        const float w = lossGauss[LOSS_HALO + d];
+                        const float X = rp[(y * W + xx) * C + c];
+                        const float Y = gp[(y * W + xx) * C + c];
+                        sX += X * w;
+                        sX2 += X * X * w;
+                        sY += Y * w;
+                        sY2 += Y * Y * w;
+                        sXY += X * Y * w;
+                    }
+                    float *hb = &hbuf[(static_cast<long long>(y) * W + x) * 5];
+                    hb[0] = sX; hb[1] = sX2; hb[2] = sY; hb[3] = sY2; hb[4] = sXY;
+                }
+            }
+        });
+
+        parallelChunks(numBands, numWorkers, [&](int band, int){
+            const int yStart = band * H / numBands;
+            const int yEnd = (band + 1) * H / numBands;
+            for (int y = yStart; y < yEnd; y++){
+                for (int x = 0; x < W; x++){
+                    float m0 = 0.f, m1 = 0.f, m2 = 0.f, m3 = 0.f, m4 = 0.f;
+                    for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                        const int yy = y + d;
+                        if (yy < 0 || yy >= H) continue;
+                        const float w = lossGauss[LOSS_HALO + d];
+                        const float *hb = &hbuf[(static_cast<long long>(yy) * W + x) * 5];
+                        m0 += hb[0] * w;
+                        m1 += hb[1] * w;
+                        m2 += hb[2] * w;
+                        m3 += hb[3] * w;
+                        m4 += hb[4] * w;
+                    }
+                    const float muX = m0;
+                    const float muY = m2;
+                    const float sigmaX = m1 - muX * muX;
+                    const float sigmaY = m3 - muY * muY;
+                    const float sigmaXY = m4 - muX * muY;
+
+                    const float A = muX * muX + muY * muY + 0.0001f;
+                    const float B = sigmaX + sigmaY + 0.0009f;
+                    const float Cc = 2.f * muX * muY + 0.0001f;
+                    const float Dc = 2.f * sigmaXY + 0.0009f;
+                    const float s = (Cc * Dc) / (A * B);
+
+                    const int p = y * W + x;
+                    if (c == 0) sp[p] = s / static_cast<float>(C);
+                    else sp[p] += s / static_cast<float>(C);
+
+                    if (pMu){
+                        const long long idx = static_cast<long long>(p) * C + c;
+                        const float dMu = (muY * 2.f * Dc) / (A * B) - (muY * 2.f * Cc) / (A * B)
+                                        - (muX * 2.f * Cc * Dc) / (A * A * B) + (muX * 2.f * Cc * Dc) / (A * B * B);
+                        pMu[idx] = static_cast<at::Half>(dMu);
+                        pS1[idx] = static_cast<at::Half>((-Cc * Dc) / (A * B * B));
+                        pS12[idx] = static_cast<at::Half>((2.f * Cc) / (A * B));
+                    }
+                }
+            }
+        });
+    }
+
+    // Reduction to the scalar loss + normalization denominator
+    std::vector<double> lossSums(numBands, 0.0);
+    std::vector<double> gateSums(numBands, 0.0);
+    parallelChunks(numBands, numWorkers, [&](int band, int){
+        const int yStart = band * H / numBands;
+        const int yEnd = (band + 1) * H / numBands;
+        double lossSum = 0.0, gateSum = 0.0;
+        for (int y = yStart; y < yEnd; y++){
+            for (int x = 0; x < W; x++){
+                const int p = y * W + x;
+                const float gate = mp ? mp[p] : (lossValid(y, x, H, W, valid_padding) ? 1.0f : 0.0f);
+                if (gate == 0.0f) continue;
+                float l1 = 0.0f;
+                for (int c = 0; c < C; c++){
+                    l1 += std::fabs(rp[p * C + c] - gp[p * C + c]);
+                }
+                lossSum += gate * ((1.0f - ssim_weight) * l1
+                                 + static_cast<float>(C) * ssim_weight * (1.0f - sp[p]));
+                gateSum += gate;
+            }
+        }
+        lossSums[band] = lossSum;
+        gateSums[band] = gateSum;
+    });
+    double lossSum = 0.0, gateSum = 0.0;
+    for (int b = 0; b < numBands; b++){ lossSum += lossSums[b]; gateSum += gateSums[b]; }
+    const double denom = gateSum * C + 1e-8;
+
+    torch::Tensor stats = torch::empty({2}, fOpts);
+    stats.data_ptr<float>()[0] = static_cast<float>(lossSum / denom);
+    stats.data_ptr<float>()[1] = static_cast<float>(denom);
+    return std::make_tuple(stats, partials);
+}
+
+torch::Tensor fused_loss_backward_tensor_cpu(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask,
+    const torch::Tensor &partials,
+    const torch::Tensor &stats,
+    const torch::Tensor &v_loss,
+    const float ssim_weight,
+    const bool valid_padding
+){
+    torch::Tensor r = rendered.contiguous();
+    torch::Tensor g = gt.contiguous();
+    const int H = r.size(0);
+    const int W = r.size(1);
+    const int C = r.size(2);
+    const bool hasMask = mask.defined() && mask.numel() > 0;
+    torch::Tensor m = hasMask ? mask.contiguous() : torch::Tensor();
+
+    const float *rp = r.data_ptr<float>();
+    const float *gp = g.data_ptr<float>();
+    const float *mp = hasMask ? m.data_ptr<float>() : nullptr;
+    const at::Half *pBase = partials.data_ptr<at::Half>();
+    const long long planeSize = static_cast<long long>(H) * W * C;
+    const at::Half *pMu = pBase;
+    const at::Half *pS1 = pBase + planeSize;
+    const at::Half *pS12 = pBase + 2 * planeSize;
+    const float chainScale = v_loss.contiguous().data_ptr<float>()[0] / stats.data_ptr<float>()[1];
+
+    torch::Tensor vRendered = torch::empty_like(r);
+    float *vp = vRendered.data_ptr<float>();
+
+    torch::Tensor hbufT = torch::empty({static_cast<long long>(H) * W * 3}, r.options());
+    float *hbuf = hbufT.data_ptr<float>();
+
+    const int numWorkers = rasterWorkers(H);
+    const int numBands = (std::min)(H, numWorkers * CHUNKS_PER_WORKER);
+
+    auto gateAt = [&](int y, int x) -> float {
+        return mp ? mp[y * W + x] : (lossValid(y, x, H, W, valid_padding) ? 1.0f : 0.0f);
+    };
+
+    for (int c = 0; c < C; c++){
+        parallelChunks(numBands, numWorkers, [&](int band, int){
+            const int yStart = band * H / numBands;
+            const int yEnd = (band + 1) * H / numBands;
+            for (int y = yStart; y < yEnd; y++){
+                for (int x = 0; x < W; x++){
+                    float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+                    for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                        const int xx = x + d;
+                        if (xx < 0 || xx >= W) continue;
+                        const float chain = -ssim_weight * gateAt(y, xx) * chainScale;
+                        if (chain == 0.0f) continue;
+                        const float w = lossGauss[LOSS_HALO + d];
+                        const long long idx = (static_cast<long long>(y) * W + xx) * C + c;
+                        a0 += static_cast<float>(pMu[idx]) * chain * w;
+                        a1 += static_cast<float>(pS1[idx]) * chain * w;
+                        a2 += static_cast<float>(pS12[idx]) * chain * w;
+                    }
+                    float *hb = &hbuf[(static_cast<long long>(y) * W + x) * 3];
+                    hb[0] = a0; hb[1] = a1; hb[2] = a2;
+                }
+            }
+        });
+
+        parallelChunks(numBands, numWorkers, [&](int band, int){
+            const int yStart = band * H / numBands;
+            const int yEnd = (band + 1) * H / numBands;
+            for (int y = yStart; y < yEnd; y++){
+                for (int x = 0; x < W; x++){
+                    float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+                    for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                        const int yy = y + d;
+                        if (yy < 0 || yy >= H) continue;
+                        const float w = lossGauss[LOSS_HALO + d];
+                        const float *hb = &hbuf[(static_cast<long long>(yy) * W + x) * 3];
+                        s0 += hb[0] * w;
+                        s1 += hb[1] * w;
+                        s2 += hb[2] * w;
+                    }
+                    const long long p = static_cast<long long>(y) * W + x;
+                    const float p1 = rp[p * C + c];
+                    const float p2 = gp[p * C + c];
+                    const float gradSsim = s0 + 2.f * p1 * s1 + p2 * s2;
+
+                    const float gate = gateAt(y, x);
+                    const float sign = (p1 == p2) ? 0.0f : std::copysign(1.0f, p1 - p2);
+                    vp[p * C + c] = gradSsim + (1.0f - ssim_weight) * sign * gate * chainScale;
+                }
+            }
+        });
+    }
+
+    return vRendered;
+}

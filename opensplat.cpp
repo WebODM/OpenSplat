@@ -39,7 +39,6 @@ int main(int argc, char *argv[]){
         ("densify-from", "Start densifying gaussians after these many steps", cxxopts::value<int>()->default_value("500"))
         ("densify-until", "Stop densifying gaussians after these many steps (-1 = min(15000, half of num-iters))", cxxopts::value<int>()->default_value("-1"))
         ("loss-thresh", "High-error pixel threshold on the normalized L1 map for multi-view scoring", cxxopts::value<float>()->default_value("0.1"))
-        ("opacity-reg", "Opacity regularization weight (penalizes haze/floaters, 0 to disable)", cxxopts::value<float>()->default_value("0.01"))
         ("no-edge-guidance", "Disable Canny edge weighting of the densification importance", cxxopts::value<bool>()->default_value("false"))
         ("max-gaussians", "Maximum number of gaussians (0 = unlimited)", cxxopts::value<int>()->default_value("5000000"))
         ("no-masks", "Ignore image masks even when present", cxxopts::value<bool>()->default_value("false"))
@@ -150,7 +149,6 @@ int main(int argc, char *argv[]){
                     numIters, keepCrs,
                     device);
         model.trainCams = &cams;
-        model.opacityReg = result["opacity-reg"].as<float>();
         model.edgeGuidance = !result["no-edge-guidance"].as<bool>();
         Camera::gpuCacheEnabled = !result["no-gpu-cache"].as<bool>();
 
@@ -174,7 +172,7 @@ int main(int argc, char *argv[]){
 
             torch::Tensor mainLoss = model.mainLoss(rgb, gt, mask, ssimWeight);
             mainLoss.backward();
-            
+
             if (step % displayStep == 0) {
                 const float percentage = static_cast<float>(step) / numIters;
                 std::cout << "Step " << step << ": " << mainLoss.item<float>() << " [" << floor(percentage * 100) << "%]" <<  std::endl;

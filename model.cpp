@@ -397,9 +397,7 @@ std::tuple<torch::Tensor, torch::Tensor> Model::computeMultiViewScores(int step,
         (rgb.sum() * 0.0f).backward();
 
         torch::NoGradGuard noGrad;
-        torch::Tensor ssimLoss = 1.0f - ssim.eval(rgb.detach(), gt);
-        torch::Tensor l1Loss = torch::abs(gt - rgb.detach()).mean();
-        float photometric = (0.8f * l1Loss + 0.2f * ssimLoss).item<float>();
+        float photometric = fusedL1SsimLossValue(rgb.detach(), gt, 0.2f).item<float>();
 
         torch::Tensor counts = densificationInfo[3] * static_cast<float>(ds * ds);
         fullCounts += counts;
@@ -1024,34 +1022,21 @@ int Model::loadPly(const std::string &filename){
 
 torch::Tensor Model::mainLoss(torch::Tensor &rgb, torch::Tensor &gt, torch::Tensor &mask, float ssimWeight){
     bool hasMask = mask.defined() && mask.numel() > 0;
-    torch::Tensor w = hasMask ? mask : torch::Tensor();
+    torch::Tensor loss;
 
-    torch::Tensor absDiff = torch::abs(gt - rgb);
-    torch::Tensor l1Loss = hasMask
-        ? (w.unsqueeze(-1) * absDiff).sum() / (w.sum() * gt.size(2) + 1e-8f)
-        : absDiff.sum() / (static_cast<float>(gt.numel()) + 1e-8f);
-
-    torch::Tensor ssimMap = ssim.map(rgb, gt);
-    int pad = ssim.getWindowSize() / 2;
-    torch::Tensor sv = ssimMap.index({Slice(pad, ssimMap.size(0) - pad), Slice(pad, ssimMap.size(1) - pad)});
-    torch::Tensor dssim;
-    if (hasMask){
-        torch::Tensor wv = w.index({Slice(pad, w.size(0) - pad), Slice(pad, w.size(1) - pad)});
-        dssim = (wv * (1.0f - sv)).sum() / (wv.sum() + 1e-8f);
+    if (ssimWeight > 0.0f){
+        torch::Tensor m = hasMask ? mask : torch::empty({0}, rgb.options());
+        loss = fusedL1SsimLoss(rgb, gt, m, ssimWeight, !hasMask);
     }else{
-        dssim = (1.0f - sv).sum() / (static_cast<float>(sv.numel()) + 1e-8f);
+        torch::Tensor absDiff = torch::abs(gt - rgb);
+        loss = hasMask
+            ? (mask.unsqueeze(-1) * absDiff).sum() / (mask.sum() * gt.size(2) + 1e-8f)
+            : absDiff.sum() / (static_cast<float>(gt.numel()) + 1e-8f);
     }
-
-    torch::Tensor loss = (1.0f - ssimWeight) * l1Loss + ssimWeight * dssim;
 
     // Segment-mode opacity penalty: push alpha to 0 in masked areas
-    if (hasMask && lastAlpha.defined() && lastAlpha.numel() == w.numel()){
-        loss = loss + (lastAlpha * (1.0f - w).pow(2.0f)).mean();
-    }
-
-    // Global opacity regularization: penalize haze and floaters
-    if (opacityReg > 0.0f){
-        loss = loss + opacityReg * torch::sigmoid(opacities).mean();
+    if (hasMask && lastAlpha.defined() && lastAlpha.numel() == mask.numel()){
+        loss = loss + (lastAlpha * (1.0f - mask).pow(2.0f)).mean();
     }
 
     return loss;

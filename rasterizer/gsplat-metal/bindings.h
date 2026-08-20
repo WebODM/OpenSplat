@@ -16,30 +16,27 @@ std::tuple<
     torch::Tensor> // output radii
 compute_cov2d_bounds_tensor(const int num_pts, torch::Tensor &A);
 
-torch::Tensor fused_ssim_stack_tensor(
-    const torch::Tensor &x,
-    const torch::Tensor &y);
+// Fused L1 + DSSIM loss over [H,W,C] float images.
+// Returns {stats, partials}: stats[0] = loss, stats[1] = normalization
+// denominator (both on device); partials holds the SSIM derivative maps
+// needed by the backward pass (empty when want_grad is false).
+std::tuple<torch::Tensor, torch::Tensor> fused_loss_forward_tensor(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask, // [H,W] float or empty
+    const float ssim_weight,
+    const bool valid_padding,
+    const bool want_grad);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-fused_ssim_pointwise_fwd_tensor(
-    const torch::Tensor &muX,
-    const torch::Tensor &muY,
-    const torch::Tensor &blurY2,
-    const torch::Tensor &blurXY,
-    const torch::Tensor &sigmaX);
-
-torch::Tensor fused_ssim_pointwise_bwd_pre_tensor(
-    const torch::Tensor &g,
-    const torch::Tensor &m1,
-    const torch::Tensor &m2,
-    const torch::Tensor &m3);
-
-torch::Tensor fused_ssim_pointwise_bwd_post_tensor(
-    const torch::Tensor &b1,
-    const torch::Tensor &b2,
-    const torch::Tensor &b3,
-    const torch::Tensor &x,
-    const torch::Tensor &y);
+torch::Tensor fused_loss_backward_tensor(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask,
+    const torch::Tensor &partials,
+    const torch::Tensor &stats,
+    const torch::Tensor &v_loss,
+    const float ssim_weight,
+    const bool valid_padding);
 
 torch::Tensor compute_sh_forward_tensor(
     unsigned num_points,

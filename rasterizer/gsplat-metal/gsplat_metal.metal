@@ -1578,86 +1578,314 @@ kernel void compute_cov2d_bounds_kernel(
     radii[row] = radius;
 }
 
-// Builds the [5C,1,H,W] blur input (x, y, x*x, y*y, x*y) in a single pass.
-kernel void fused_ssim_stack_kernel(
-    constant int& n, // elements per channel-block (x.numel())
-    device const float* x,
-    device const float* y,
-    device float* stacked,
-    uint i [[thread_position_in_grid]]
-) {
-    if ((int)i >= n) return;
-    const float xi = x[i];
-    const float yi = y[i];
-    stacked[i] = xi;
-    stacked[n + i] = yi;
-    stacked[2 * n + i] = xi * xi;
-    stacked[3 * n + i] = yi * yi;
-    stacked[4 * n + i] = xi * yi;
+// Fused L1 + DSSIM loss over [H,W,C] images. One kernel computes the
+// SSIM map and the closed-form partials in a threadgroup-memory tile
+// (two-pass separable 11-tap blur), one reduces to the scalar loss
+// on-device, and one produces dL/dimage directly.
+
+#define LOSS_BX 16
+#define LOSS_BY 16
+#define LOSS_HALO 5
+#define LOSS_SX (LOSS_BX + 2 * LOSS_HALO)
+#define LOSS_SY (LOSS_BY + 2 * LOSS_HALO)
+#define LOSS_C1 0.0001f
+#define LOSS_C2 0.0009f
+
+// 11-tap gaussian (sigma 1.5), matches the SSIM reference window
+constant float lossGauss[11] = {
+    0.001028380123898387f, 0.0075987582094967365f, 0.036000773310661316f,
+    0.10936068743467331f, 0.21300552785396576f, 0.26601171493530273f,
+    0.21300552785396576f, 0.10936068743467331f, 0.036000773310661316f,
+    0.0075987582094967365f, 0.001028380123898387f};
+
+inline float loss_pix(device const float* img, int y, int x, int c, int H, int W, int C){
+    if (x < 0 || x >= W || y < 0 || y >= H) return 0.0f;
+    return img[(y * W + x) * C + c];
 }
 
-kernel void fused_ssim_pointwise_fwd_kernel(
-    constant int& n,
-    device const float* muX,
-    device const float* muY,
-    device const float* blurY2,
-    device const float* blurXY,
-    device const float* sigmaX,
-    device float* S,
-    device float* m1,
-    device float* m2,
-    device float* m3,
-    uint i [[thread_position_in_grid]]
-) {
-    if ((int)i >= n) return;
-    const float c1 = 0.0001f;
-    const float c2 = 0.0009f;
-    float mx = muX[i];
-    float my = muY[i];
-    float sy = blurY2[i] - my * my;
-    float sxy = blurXY[i] - mx * my;
-    float A1 = 2.f * mx * my + c1;
-    float A2 = 2.f * sxy + c2;
-    float B1 = mx * mx + my * my + c1;
-    float B2 = sigmaX[i] + sy + c2;
-    float ib = 1.f / (B1 * B2);
-    float s = A1 * A2 * ib;
-    S[i] = s;
-    float dMu = 2.f * A2 * (mx * B1 - my * A1) * ib / B1;
-    float dSy = -s / B2;
-    float dSxy = 2.f * A1 * ib;
-    m1[i] = dMu - 2.f * my * dSy - mx * dSxy;
-    m2[i] = dSy;
-    m3[i] = dSxy;
+inline bool loss_valid(int y, int x, int H, int W, bool validPad){
+    if (!validPad || H <= 10 || W <= 10) return true;
+    return x >= LOSS_HALO && x < W - LOSS_HALO && y >= LOSS_HALO && y < H - LOSS_HALO;
 }
 
-kernel void fused_ssim_pointwise_bwd_pre_kernel(
-    constant int& n,
-    constant int& pixels,
-    device const float* g,
-    device const float* m1,
-    device const float* m2,
-    device const float* m3,
-    device float* stacked,
-    uint i [[thread_position_in_grid]]
+kernel void fused_loss_fwd_kernel(
+    constant int& H,
+    constant int& W,
+    constant int& C,
+    constant int& wantGrad,
+    device const float* rendered,
+    device const float* gt,
+    device float* ssimMap, // [H,W] channel mean
+    device half* pMu,      // [H,W,C] each (dummy when !wantGrad)
+    device half* pS1,
+    device half* pS12,
+    uint2 tpos [[thread_position_in_threadgroup]],
+    uint2 gpos [[threadgroup_position_in_grid]]
 ) {
-    if ((int)i >= n) return;
-    const float gi = g[(int)i % pixels];
-    stacked[i] = gi * m1[i];
-    stacked[n + i] = gi * m2[i];
-    stacked[2 * n + i] = gi * m3[i];
+    const int px = (int)(gpos.x * LOSS_BX + tpos.x);
+    const int py = (int)(gpos.y * LOSS_BY + tpos.y);
+    const int tileX = (int)(gpos.x * LOSS_BX);
+    const int tileY = (int)(gpos.y * LOSS_BY);
+
+    threadgroup float sTile[LOSS_SY][LOSS_SX][2];
+    threadgroup float sConv[LOSS_SY][LOSS_BX][5];
+
+    float ssimSum = 0.0f;
+    for (int c = 0; c < C; c++){
+        // Load tile + halo
+        {
+            const int tileSize = LOSS_SY * LOSS_SX;
+            const int threads = LOSS_BX * LOSS_BY;
+            const int tRank = (int)(tpos.y * LOSS_BX + tpos.x);
+            for (int tid = tRank; tid < tileSize; tid += threads){
+                const int ly = tid / LOSS_SX;
+                const int lx = tid % LOSS_SX;
+                const int gy = tileY + ly - LOSS_HALO;
+                const int gx = tileX + lx - LOSS_HALO;
+                sTile[ly][lx][0] = loss_pix(rendered, gy, gx, c, H, W, C);
+                sTile[ly][lx][1] = loss_pix(gt, gy, gx, c, H, W, C);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Horizontal pass: accumulate moments; each thread covers two rows
+        {
+            const int lx = (int)tpos.x + LOSS_HALO;
+            for (int pass = 0; pass < 2; pass++){
+                const int ly = (int)tpos.y + pass * LOSS_BY;
+                if (ly >= LOSS_SY) break;
+                float sX = 0.f, sX2 = 0.f, sY = 0.f, sY2 = 0.f, sXY = 0.f;
+                for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                    const float w = lossGauss[LOSS_HALO + d];
+                    const float x = sTile[ly][lx + d][0];
+                    const float y = sTile[ly][lx + d][1];
+                    sX += x * w;
+                    sX2 += x * x * w;
+                    sY += y * w;
+                    sY2 += y * y * w;
+                    sXY += x * y * w;
+                }
+                sConv[ly][tpos.x][0] = sX;
+                sConv[ly][tpos.x][1] = sX2;
+                sConv[ly][tpos.x][2] = sY;
+                sConv[ly][tpos.x][3] = sY2;
+                sConv[ly][tpos.x][4] = sXY;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Vertical pass + SSIM + partials
+        if (px < W && py < H){
+            const int ly = (int)tpos.y + LOSS_HALO;
+            const int lx = (int)tpos.x;
+            float m0 = 0.f, m1 = 0.f, m2 = 0.f, m3 = 0.f, m4 = 0.f;
+            for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                const float w = lossGauss[LOSS_HALO + d];
+                m0 += sConv[ly + d][lx][0] * w;
+                m1 += sConv[ly + d][lx][1] * w;
+                m2 += sConv[ly + d][lx][2] * w;
+                m3 += sConv[ly + d][lx][3] * w;
+                m4 += sConv[ly + d][lx][4] * w;
+            }
+            const float muX = m0;
+            const float muY = m2;
+            const float sigmaX = m1 - muX * muX;
+            const float sigmaY = m3 - muY * muY;
+            const float sigmaXY = m4 - muX * muY;
+
+            const float A = muX * muX + muY * muY + LOSS_C1;
+            const float B = sigmaX + sigmaY + LOSS_C2;
+            const float Cc = 2.f * muX * muY + LOSS_C1;
+            const float Dc = 2.f * sigmaXY + LOSS_C2;
+            const float s = (Cc * Dc) / (A * B);
+            ssimSum += s;
+
+            if (wantGrad){
+                const int idx = (py * W + px) * C + c;
+                const float dMu = (muY * 2.f * Dc) / (A * B) - (muY * 2.f * Cc) / (A * B)
+                                - (muX * 2.f * Cc * Dc) / (A * A * B) + (muX * 2.f * Cc * Dc) / (A * B * B);
+                pMu[idx] = half(dMu);
+                pS1[idx] = half((-Cc * Dc) / (A * B * B));
+                pS12[idx] = half((2.f * Cc) / (A * B));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (px < W && py < H){
+        ssimMap[py * W + px] = ssimSum / (float)C;
+    }
 }
 
-kernel void fused_ssim_pointwise_bwd_post_kernel(
-    constant int& n,
-    device const float* b1,
-    device const float* b2,
-    device const float* b3,
-    device const float* x,
-    device const float* y,
-    device float* gradY,
+kernel void fused_loss_reduce_kernel(
+    constant int& H,
+    constant int& W,
+    constant int& C,
+    constant int& hasMask,
+    constant float& ssimWeight,
+    constant int& validPad,
+    device const float* rendered,
+    device const float* gt,
+    device const float* ssimMap,
+    device const float* mask,
+    device atomic_float* out,
+    uint tid [[thread_position_in_threadgroup]],
+    uint gid [[thread_position_in_grid]],
+    uint gridSize [[threads_per_grid]]
+) {
+    const int numPix = H * W;
+    float lossSum = 0.0f;
+    float gateSum = 0.0f;
+    for (int p = (int)gid; p < numPix; p += (int)gridSize){
+        const int y = p / W;
+        const int x = p % W;
+        float gate;
+        if (hasMask){
+            gate = mask[p];
+        }else{
+            gate = loss_valid(y, x, H, W, validPad != 0) ? 1.0f : 0.0f;
+        }
+        if (gate != 0.0f){
+            float l1 = 0.0f;
+            for (int c = 0; c < C; c++){
+                l1 += fabs(rendered[p * C + c] - gt[p * C + c]);
+            }
+            const float contrib = (1.0f - ssimWeight) * l1
+                                + (float)C * ssimWeight * (1.0f - ssimMap[p]);
+            lossSum += gate * contrib;
+            gateSum += gate;
+        }
+    }
+
+    threadgroup float sLoss[256];
+    threadgroup float sGate[256];
+    sLoss[tid] = lossSum;
+    sGate[tid] = gateSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1){
+        if (tid < stride){
+            sLoss[tid] += sLoss[tid + stride];
+            sGate[tid] += sGate[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0){
+        atomic_fetch_add_explicit(&out[0], sLoss[0], memory_order_relaxed);
+        atomic_fetch_add_explicit(&out[1], sGate[0], memory_order_relaxed);
+    }
+}
+
+kernel void fused_loss_finalize_kernel(
+    constant int& C,
+    device float* out,
     uint i [[thread_position_in_grid]]
 ) {
-    if ((int)i >= n) return;
-    gradY[i] = b1[i] + 2.f * y[i] * b2[i] + x[i] * b3[i];
+    if (i > 0) return;
+    const float denom = out[1] * (float)C + 1e-8f;
+    out[0] = out[0] / denom;
+    out[1] = denom;
+}
+
+kernel void fused_loss_bwd_kernel(
+    constant int& H,
+    constant int& W,
+    constant int& C,
+    constant int& hasMask,
+    constant float& ssimWeight,
+    constant int& validPad,
+    device const float* rendered,
+    device const float* gt,
+    device const float* mask,
+    device const half* pMu,
+    device const half* pS1,
+    device const half* pS12,
+    device const float* stats, // stats[1] = denominator
+    device const float* vLoss,
+    device float* vRendered,
+    uint2 tpos [[thread_position_in_threadgroup]],
+    uint2 gpos [[threadgroup_position_in_grid]]
+) {
+    const int px = (int)(gpos.x * LOSS_BX + tpos.x);
+    const int py = (int)(gpos.y * LOSS_BY + tpos.y);
+    const int tileX = (int)(gpos.x * LOSS_BX);
+    const int tileY = (int)(gpos.y * LOSS_BY);
+    const float chainScale = vLoss[0] / stats[1];
+
+    threadgroup float sData[LOSS_SY][LOSS_SX][3];
+    threadgroup float sConv[LOSS_SY][LOSS_BX][3];
+
+    for (int c = 0; c < C; c++){
+        float p1 = 0.f, p2 = 0.f;
+        if (px < W && py < H){
+            p1 = rendered[(py * W + px) * C + c];
+            p2 = gt[(py * W + px) * C + c];
+        }
+
+        // Load the chain-weighted partials for the tile + halo
+        {
+            const int tileSize = LOSS_SY * LOSS_SX;
+            const int threads = LOSS_BX * LOSS_BY;
+            const int tRank = (int)(tpos.y * LOSS_BX + tpos.x);
+            for (int tid = tRank; tid < tileSize; tid += threads){
+                const int ly = tid / LOSS_SX;
+                const int lx = tid % LOSS_SX;
+                const int gy = tileY + ly - LOSS_HALO;
+                const int gx = tileX + lx - LOSS_HALO;
+                const bool inside = gx >= 0 && gx < W && gy >= 0 && gy < H;
+                float chain = 0.0f;
+                if (inside){
+                    const float gate = hasMask ? mask[gy * W + gx]
+                                               : (loss_valid(gy, gx, H, W, validPad != 0) ? 1.0f : 0.0f);
+                    chain = -ssimWeight * gate * chainScale;
+                }
+                const int idx = (gy * W + gx) * C + c;
+                sData[ly][lx][0] = inside ? (float)pMu[idx] * chain : 0.0f;
+                sData[ly][lx][1] = inside ? (float)pS1[idx] * chain : 0.0f;
+                sData[ly][lx][2] = inside ? (float)pS12[idx] * chain : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Horizontal pass
+        {
+            const int lx = (int)tpos.x + LOSS_HALO;
+            for (int pass = 0; pass < 2; pass++){
+                const int ly = (int)tpos.y + pass * LOSS_BY;
+                if (ly >= LOSS_SY) break;
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+                for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                    const float w = lossGauss[LOSS_HALO + d];
+                    a0 += sData[ly][lx + d][0] * w;
+                    a1 += sData[ly][lx + d][1] * w;
+                    a2 += sData[ly][lx + d][2] * w;
+                }
+                sConv[ly][tpos.x][0] = a0;
+                sConv[ly][tpos.x][1] = a1;
+                sConv[ly][tpos.x][2] = a2;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Vertical pass + L1 term
+        if (px < W && py < H){
+            const int ly = (int)tpos.y + LOSS_HALO;
+            const int lx = (int)tpos.x;
+            float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+            for (int d = -LOSS_HALO; d <= LOSS_HALO; d++){
+                const float w = lossGauss[LOSS_HALO + d];
+                s0 += sConv[ly + d][lx][0] * w;
+                s1 += sConv[ly + d][lx][1] * w;
+                s2 += sConv[ly + d][lx][2] * w;
+            }
+            const float gradSsim = s0 + 2.f * p1 * s1 + p2 * s2;
+
+            const float gate = hasMask ? mask[py * W + px]
+                                       : (loss_valid(py, px, H, W, validPad != 0) ? 1.0f : 0.0f);
+            const float sign = (p1 == p2) ? 0.0f : copysign(1.0f, p1 - p2);
+            const float gradL1 = (1.0f - ssimWeight) * sign * gate * chainScale;
+
+            vRendered[(py * W + px) * C + c] = gradSsim + gradL1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }

@@ -21,10 +21,10 @@ struct MetalContext {
     id<MTLComputePipelineState> compute_cov2d_bounds_kernel_cpso;
     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
     id<MTLComputePipelineState> get_tile_bin_edges_kernel_cpso;
-    id<MTLComputePipelineState> fused_ssim_stack_kernel_cpso;
-    id<MTLComputePipelineState> fused_ssim_pointwise_fwd_kernel_cpso;
-    id<MTLComputePipelineState> fused_ssim_pointwise_bwd_pre_kernel_cpso;
-    id<MTLComputePipelineState> fused_ssim_pointwise_bwd_post_kernel_cpso;
+    id<MTLComputePipelineState> fused_loss_fwd_kernel_cpso;
+    id<MTLComputePipelineState> fused_loss_reduce_kernel_cpso;
+    id<MTLComputePipelineState> fused_loss_finalize_kernel_cpso;
+    id<MTLComputePipelineState> fused_loss_bwd_kernel_cpso;
 };
 
 unsigned num_sh_bases(const unsigned degree) {
@@ -123,10 +123,10 @@ MetalContext* init_gsplat_metal_context() {
     GSPLAT_METAL_ADD_KERNEL(compute_cov2d_bounds_kernel);
     GSPLAT_METAL_ADD_KERNEL(map_gaussian_to_intersects_kernel);
     GSPLAT_METAL_ADD_KERNEL(get_tile_bin_edges_kernel);
-    GSPLAT_METAL_ADD_KERNEL(fused_ssim_stack_kernel);
-    GSPLAT_METAL_ADD_KERNEL(fused_ssim_pointwise_fwd_kernel);
-    GSPLAT_METAL_ADD_KERNEL(fused_ssim_pointwise_bwd_pre_kernel);
-    GSPLAT_METAL_ADD_KERNEL(fused_ssim_pointwise_bwd_post_kernel);
+    GSPLAT_METAL_ADD_KERNEL(fused_loss_fwd_kernel);
+    GSPLAT_METAL_ADD_KERNEL(fused_loss_reduce_kernel);
+    GSPLAT_METAL_ADD_KERNEL(fused_loss_finalize_kernel);
+    GSPLAT_METAL_ADD_KERNEL(fused_loss_bwd_kernel);
 
     [metal_library release];
 
@@ -926,104 +926,116 @@ std::
 
     return std::make_tuple(v_xy, v_conic, v_colors, v_opacity);
 }
-// Dispatch helper for the flat, one-thread-per-element SSIM kernels.
-static void dispatch1D(MetalContext* ctx, id<MTLComputePipelineState> cpso, int n, std::vector<EncodeArg> args) {
-    MTLSize grid_size = MTLSizeMake(n, 1, 1);
-    NSUInteger threads = MIN(cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
-    dispatchKernel(ctx, cpso, grid_size, MTLSizeMake(threads, 1, 1), args);
-}
-
-torch::Tensor fused_ssim_stack_tensor(
-    const torch::Tensor &x,
-    const torch::Tensor &y
+std::tuple<torch::Tensor, torch::Tensor> fused_loss_forward_tensor(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask,
+    const float ssim_weight,
+    const bool valid_padding,
+    const bool want_grad
 ){
-    CHECK_INPUT(x);
-    CHECK_INPUT(y);
-    const int n = x.numel();
-    torch::Tensor stacked = torch::empty({5 * x.size(0), x.size(1), x.size(2), x.size(3)}, x.options());
+    CHECK_INPUT(rendered);
+    CHECK_INPUT(gt);
+    const int H = rendered.size(0);
+    const int W = rendered.size(1);
+    const int C = rendered.size(2);
+    const bool hasMask = mask.defined() && mask.numel() > 0;
+    if (hasMask){ CHECK_INPUT(mask); }
+
+    auto opts = rendered.options();
+    torch::Tensor ssimMap = torch::empty({H, W}, opts);
+    torch::Tensor partials = want_grad
+        ? torch::empty({3, static_cast<long long>(H) * W * C}, opts.dtype(torch::kHalf))
+        : torch::empty({1}, opts.dtype(torch::kHalf)); // dummy buffer
+    torch::Tensor maskBuf = hasMask ? mask : torch::empty({1}, opts); // dummy buffer
+    const long long planeSize = static_cast<long long>(H) * W * C;
+    (void)planeSize;
+    torch::Tensor pMu = want_grad ? partials[0] : partials;
+    torch::Tensor pS1 = want_grad ? partials[1] : partials;
+    torch::Tensor pS12 = want_grad ? partials[2] : partials;
 
     MetalContext* ctx = get_global_context();
-    dispatch1D(ctx, ctx->fused_ssim_stack_kernel_cpso, n, {
-        EncodeArg::scalar(n),
-        EncodeArg::tensor(x),
-        EncodeArg::tensor(y),
-        EncodeArg::tensor(stacked)
+    MTLSize tileGrid = MTLSizeMake((W + 15) / 16, (H + 15) / 16, 1);
+    MTLSize tileGroup = MTLSizeMake(16, 16, 1);
+    dispatchKernelEx(ctx, ctx->fused_loss_fwd_kernel_cpso, tileGrid, tileGroup, true, {
+        EncodeArg::scalar((int32_t)H),
+        EncodeArg::scalar((int32_t)W),
+        EncodeArg::scalar((int32_t)C),
+        EncodeArg::scalar((int32_t)(want_grad ? 1 : 0)),
+        EncodeArg::tensor(rendered),
+        EncodeArg::tensor(gt),
+        EncodeArg::tensor(ssimMap),
+        EncodeArg::tensor(pMu),
+        EncodeArg::tensor(pS1),
+        EncodeArg::tensor(pS12)
     });
-    return stacked;
+
+    torch::Tensor stats = torch::zeros({2}, opts);
+    const int numPix = H * W;
+    const int reduceThreads = std::min(numPix, 256 * 1024);
+    MTLSize reduceGrid = MTLSizeMake((reduceThreads + 255) / 256, 1, 1);
+    MTLSize reduceGroup = MTLSizeMake(256, 1, 1);
+    dispatchKernelEx(ctx, ctx->fused_loss_reduce_kernel_cpso, reduceGrid, reduceGroup, true, {
+        EncodeArg::scalar((int32_t)H),
+        EncodeArg::scalar((int32_t)W),
+        EncodeArg::scalar((int32_t)C),
+        EncodeArg::scalar((int32_t)(hasMask ? 1 : 0)),
+        EncodeArg::scalar(ssim_weight),
+        EncodeArg::scalar((int32_t)(valid_padding ? 1 : 0)),
+        EncodeArg::tensor(rendered),
+        EncodeArg::tensor(gt),
+        EncodeArg::tensor(ssimMap),
+        EncodeArg::tensor(maskBuf),
+        EncodeArg::tensor(stats)
+    });
+    dispatchKernel(ctx, ctx->fused_loss_finalize_kernel_cpso, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1), {
+        EncodeArg::scalar((int32_t)C),
+        EncodeArg::tensor(stats)
+    });
+
+    return std::make_tuple(stats, want_grad ? partials : torch::empty({0}, opts.dtype(torch::kHalf)));
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-fused_ssim_pointwise_fwd_tensor(
-    const torch::Tensor &muX,
-    const torch::Tensor &muY,
-    const torch::Tensor &blurY2,
-    const torch::Tensor &blurXY,
-    const torch::Tensor &sigmaX
+torch::Tensor fused_loss_backward_tensor(
+    const torch::Tensor &rendered,
+    const torch::Tensor &gt,
+    const torch::Tensor &mask,
+    const torch::Tensor &partials,
+    const torch::Tensor &stats,
+    const torch::Tensor &v_loss,
+    const float ssim_weight,
+    const bool valid_padding
 ){
-    const int n = muX.numel();
-    torch::Tensor S = torch::empty_like(muX);
-    torch::Tensor m1 = torch::empty_like(muX);
-    torch::Tensor m2 = torch::empty_like(muX);
-    torch::Tensor m3 = torch::empty_like(muX);
+    const int H = rendered.size(0);
+    const int W = rendered.size(1);
+    const int C = rendered.size(2);
+    const bool hasMask = mask.defined() && mask.numel() > 0;
+
+    torch::Tensor vRendered = torch::empty_like(rendered);
+    torch::Tensor maskBuf = hasMask ? mask : torch::empty({1}, rendered.options());
+    torch::Tensor pMu = partials[0];
+    torch::Tensor pS1 = partials[1];
+    torch::Tensor pS12 = partials[2];
 
     MetalContext* ctx = get_global_context();
-    dispatch1D(ctx, ctx->fused_ssim_pointwise_fwd_kernel_cpso, n, {
-        EncodeArg::scalar(n),
-        EncodeArg::tensor(muX),
-        EncodeArg::tensor(muY),
-        EncodeArg::tensor(blurY2),
-        EncodeArg::tensor(blurXY),
-        EncodeArg::tensor(sigmaX),
-        EncodeArg::tensor(S),
-        EncodeArg::tensor(m1),
-        EncodeArg::tensor(m2),
-        EncodeArg::tensor(m3)
+    MTLSize tileGrid = MTLSizeMake((W + 15) / 16, (H + 15) / 16, 1);
+    MTLSize tileGroup = MTLSizeMake(16, 16, 1);
+    dispatchKernelEx(ctx, ctx->fused_loss_bwd_kernel_cpso, tileGrid, tileGroup, true, {
+        EncodeArg::scalar((int32_t)H),
+        EncodeArg::scalar((int32_t)W),
+        EncodeArg::scalar((int32_t)C),
+        EncodeArg::scalar((int32_t)(hasMask ? 1 : 0)),
+        EncodeArg::scalar(ssim_weight),
+        EncodeArg::scalar((int32_t)(valid_padding ? 1 : 0)),
+        EncodeArg::tensor(rendered),
+        EncodeArg::tensor(gt),
+        EncodeArg::tensor(maskBuf),
+        EncodeArg::tensor(pMu),
+        EncodeArg::tensor(pS1),
+        EncodeArg::tensor(pS12),
+        EncodeArg::tensor(stats),
+        EncodeArg::tensor(v_loss),
+        EncodeArg::tensor(vRendered)
     });
-    return std::make_tuple(S, m1, m2, m3);
-}
-
-torch::Tensor fused_ssim_pointwise_bwd_pre_tensor(
-    const torch::Tensor &g,
-    const torch::Tensor &m1,
-    const torch::Tensor &m2,
-    const torch::Tensor &m3
-){
-    const int n = m1.numel();
-    const int pixels = g.numel();
-    torch::Tensor stacked = torch::empty({3 * m1.size(0), m1.size(1), m1.size(2), m1.size(3)}, m1.options());
-
-    MetalContext* ctx = get_global_context();
-    dispatch1D(ctx, ctx->fused_ssim_pointwise_bwd_pre_kernel_cpso, n, {
-        EncodeArg::scalar(n),
-        EncodeArg::scalar(pixels),
-        EncodeArg::tensor(g),
-        EncodeArg::tensor(m1),
-        EncodeArg::tensor(m2),
-        EncodeArg::tensor(m3),
-        EncodeArg::tensor(stacked)
-    });
-    return stacked;
-}
-
-torch::Tensor fused_ssim_pointwise_bwd_post_tensor(
-    const torch::Tensor &b1,
-    const torch::Tensor &b2,
-    const torch::Tensor &b3,
-    const torch::Tensor &x,
-    const torch::Tensor &y
-){
-    const int n = x.numel();
-    torch::Tensor gradY = torch::empty_like(x);
-
-    MetalContext* ctx = get_global_context();
-    dispatch1D(ctx, ctx->fused_ssim_pointwise_bwd_post_kernel_cpso, n, {
-        EncodeArg::scalar(n),
-        EncodeArg::tensor(b1),
-        EncodeArg::tensor(b2),
-        EncodeArg::tensor(b3),
-        EncodeArg::tensor(x),
-        EncodeArg::tensor(y),
-        EncodeArg::tensor(gradY)
-    });
-    return gradY;
+    return vRendered;
 }
