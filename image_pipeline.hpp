@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 #include <torch/torch.h>
@@ -38,7 +39,7 @@ private:
 
     void workerLoop();
     Slot *reserveSlotLocked(const Request &r);
-    void decodeInto(Slot &slot, const Request &r);
+    void decodeInto(Slot &slot, const Request &r, torch::Tensor &staging, torch::Tensor &maskStaging);
     void retuneLocked(bool waited);
 
     ImageStore &store;
@@ -50,6 +51,7 @@ private:
     std::condition_variable queueCv;
     std::condition_variable readyCv;
     bool stopping = false;
+    std::string decodeError;
 
     std::atomic<int> target{2};
     int capacity = 4;

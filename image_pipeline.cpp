@@ -28,8 +28,6 @@ struct ImagePipeline::Slot{
     int level = 0;
     int leases = 0;
     uint64_t lastUse = 0;
-    torch::Tensor staging;     // host uint8 [H,W,3]
-    torch::Tensor maskStaging; // host uint8 [H,W]
     std::shared_ptr<Frame> frame;
 };
 
@@ -82,6 +80,8 @@ ImagePipeline::Slot *ImagePipeline::reserveSlotLocked(const Request &r){
 }
 
 void ImagePipeline::workerLoop(){
+    torch::Tensor staging;     // host uint8 [H,W,3]
+    torch::Tensor maskStaging; // host uint8 [H,W]
     while (true){
         Request r;
         Slot *slot = nullptr;
@@ -111,7 +111,7 @@ void ImagePipeline::workerLoop(){
         auto t0 = std::chrono::steady_clock::now();
         std::string error;
         try{
-            decodeInto(*slot, r);
+            decodeInto(*slot, r, staging, maskStaging);
         }catch (const std::exception &e){
             error = e.what();
         }
@@ -120,7 +120,7 @@ void ImagePipeline::workerLoop(){
         {
             std::lock_guard<std::mutex> lock(m);
             if (!error.empty()){
-                std::cerr << "Image decode failed: " << error << std::endl;
+                if (decodeError.empty()) decodeError = error;
                 slot->state = Slot::FREE;
                 slot->imageId = -1;
             }else{
@@ -134,7 +134,7 @@ void ImagePipeline::workerLoop(){
     }
 }
 
-void ImagePipeline::decodeInto(Slot &slot, const Request &r){
+void ImagePipeline::decodeInto(Slot &slot, const Request &r, torch::Tensor &staging, torch::Tensor &maskStaging){
     Blob bytes = store.cache.get(ImageStore::imageKey(r.imageId, r.level));
     cv::Mat bgr = cv::imdecode(cv::Mat(1, static_cast<int>(bytes->size()), CV_8UC1, const_cast<uint8_t *>(bytes->data())),
                                cv::IMREAD_COLOR);
@@ -144,16 +144,16 @@ void ImagePipeline::decodeInto(Slot &slot, const Request &r){
 
     const bool pinned = device.is_cuda();
     auto hostOpts = torch::TensorOptions().dtype(torch::kU8).pinned_memory(pinned);
-    if (!slot.staging.defined() || slot.staging.size(0) != H || slot.staging.size(1) != W){
-        slot.staging = torch::empty({H, W, 3}, hostOpts);
+    if (!staging.defined() || staging.size(0) != H || staging.size(1) != W){
+        staging = torch::empty({H, W, 3}, hostOpts);
     }
-    cv::Mat rgb(H, W, CV_8UC3, slot.staging.data_ptr<uint8_t>());
+    cv::Mat rgb(H, W, CV_8UC3, staging.data_ptr<uint8_t>());
     cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
 
     auto frame = std::make_shared<Frame>();
     frame->imageId = r.imageId;
     frame->level = r.level;
-    frame->image = device.is_cpu() ? slot.staging.clone() : slot.staging.to(device);
+    frame->image = device.is_cpu() ? staging.clone() : staging.to(device);
 
     if (r.hasMask){
         Blob maskBytes = store.cache.get(ImageStore::maskKey(r.imageId, r.level));
@@ -162,11 +162,11 @@ void ImagePipeline::decodeInto(Slot &slot, const Request &r){
         if (mask.empty() || mask.rows != H || mask.cols != W){
             throw std::runtime_error("Cannot decode mask for image " + std::to_string(r.imageId));
         }
-        if (!slot.maskStaging.defined() || slot.maskStaging.size(0) != H || slot.maskStaging.size(1) != W){
-            slot.maskStaging = torch::empty({H, W}, hostOpts);
+        if (!maskStaging.defined() || maskStaging.size(0) != H || maskStaging.size(1) != W){
+            maskStaging = torch::empty({H, W}, hostOpts);
         }
-        std::memcpy(slot.maskStaging.data_ptr<uint8_t>(), mask.data, static_cast<size_t>(H) * W);
-        frame->mask = slot.maskStaging.to(device).to(torch::kFloat32).div_(255.0f);
+        std::memcpy(maskStaging.data_ptr<uint8_t>(), mask.data, static_cast<size_t>(H) * W);
+        frame->mask = maskStaging.to(device).to(torch::kFloat32).div_(255.0f);
     }
 
     uint64_t slotBytes = static_cast<uint64_t>(H) * W * (3 + (r.hasMask ? 4 : 0));
@@ -183,6 +183,7 @@ FrameLease ImagePipeline::acquire(const Camera &cam, int level, bool wantEdges){
     bool waited = false;
     Slot *slot = nullptr;
     while (true){
+        if (!decodeError.empty()) throw std::runtime_error("Image decode failed: " + decodeError);
         slot = nullptr;
         bool decoding = false;
         for (auto &s : slots){
