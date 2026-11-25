@@ -13,6 +13,7 @@ set(OPENSPLAT_MAX_CUDA_COMPATIBILITY OFF CACHE BOOL "Build for maximum CUDA devi
 set(OPENSPLAT_BUILD_VISUALIZER OFF CACHE BOOL "Build visualizer application")
 set(OPENSPLAT_USE_FAST_MATH OFF CACHE BOOL "Enable fast math optimizations for GPU kernels (-use_fast_math / -ffast-math)")
 set(OPENSPLAT_USE_PCH ON CACHE BOOL "Use precompiled headers to speed up compilation")
+set(OPENSPLAT_BUILD_NATIVE OFF CACHE BOOL "Build with native CPU architecture optimizations")
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
@@ -214,6 +215,11 @@ if (NOT WIN32 AND NOT APPLE)
     set(CMAKE_CUDA_COMPILER "${CUDA_TOOLKIT_ROOT_DIR}/bin/nvcc")
 endif()
 set(OpenCV_LIBS opencv_core opencv_imgproc opencv_imgcodecs opencv_highgui)
+
+if(OPENSPLAT_BUILD_NATIVE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    message(STATUS "Compiling for native CPU architecture")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-march=native>")
+endif()
 
 set(GSPLAT_LIBS gsplat_cpu)
 if((GPU_RUNTIME STREQUAL "CUDA") OR (GPU_RUNTIME STREQUAL "HIP"))
