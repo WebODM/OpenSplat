@@ -2,7 +2,7 @@
 .DS_Store
 
 # build
-build/
+build*/
 my_build/
 .idea/
 .vscode/
